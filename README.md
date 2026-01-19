@@ -11,19 +11,9 @@ If you use this code in your research, please cite the following article: https:
 - **3D U-Net Architecture**: Custom 3D U-Net with optimized architecture for volumetric data (using MONAI)
 - **Memory Efficient**: Optimized data loading and processing pipelines enabling it to run on modest GPUs (two 512×512×512 voxel volumes can be processed on a GPU with less than 4GB of VRAM by reducing batch size)
 
-## 📋 Requirements
+## 📋 Installation
 
-### Core Dependencies
-- Python 3.8+
-- PyTorch 1.9+
-- MONAI (Medical Open Network for AI)
-- NumPy
-- tifffile
-- TorchIO
-- tqdm
-- psutil
-
-### Installation
+The only less common library used in this repository is MONAI (https://project-monai.github.io/). All other dependencies are trivial and are reported in requirements.txt.
 
 ```bash
 # Clone the repository
@@ -152,3 +142,4 @@ Code was restructured with inspiration from the SSD_3D repository (https://githu
 ---
 
 **Note**: This implementation is specifically designed for 3D images. For 2D images, please consider other repositories.
+
