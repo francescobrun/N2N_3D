@@ -4,6 +4,7 @@ import json
 import tifffile
 import logging
 import psutil
+from datetime import datetime
 from argparse import ArgumentParser
 from pathlib import Path
 from typing import Optional, Tuple
@@ -192,9 +193,8 @@ def save_output(volume: np.ndarray, output_dir: Path, network_params: dict,
         # Create flat metadata dictionary (no nested JSON)
         metadata = {
             'Software': 'N2N_3D Denoising Pipeline v.1.0',
-            'shape': list(volume.shape),
             # Processing info
-            'processing_date': str(Path(__file__).stat().st_mtime),
+            'processing_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'input_json': input_json_path,
             'checkpoint_file': checkpoint_file,
             'inference_batch_size': batch_size,
