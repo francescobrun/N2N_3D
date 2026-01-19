@@ -1,0 +1,18 @@
+# Core deep learning framework
+# Note: Install torch with CUDA support for GPU acceleration
+# Visit https://pytorch.org/get-started/locally/ for CUDA-specific installation commands
+torch
+torchvision
+torchaudio
+
+# Medical image processing and deep learning
+monai
+torchio
+
+# Image processing and data handling
+tifffile
+numpy
+
+# Progress bars and utilities
+tqdm
+psutil
