@@ -388,21 +388,21 @@ def main(params):
     optimizer = torch.optim.Adam(model.parameters(), weight_decay=WEIGHT_DECAY, lr=LEARNING_RATE)
 
     # Save the training parameters including normalization statistics
-    params_dict = dict(vars(params))
     params_dict.update({
         # Data parameters:  
         'normalization_mean': float(train_dataset.mean),
         'normalization_std': float(train_dataset.std),
         # Training parameters:
+        'loaded_checkpoint_path': params.loaded_checkpoint_path,
         'loss_function': loss_func.__class__.__name__,  
         'optimizer': optimizer.__class__.__name__,  
         'learning_rate': LEARNING_RATE,  
-        'weight_decay': WEIGHT_DECAY,
-        'batch_size': params.batch_size,
+        'weight_decay': WEIGHT_DECAY,        
+        'train_patch_size': TRAIN_PATCH_SIZE,
+        'nb_patch_per_epoch': NB_PATCH_PER_EPOCH,
         'nb_train_epoch': params.nb_train_epoch,
         'training_cuda_device': params.cuda_device,
-        'nb_patch_per_epoch': NB_PATCH_PER_EPOCH,
-        'train_patch_size': TRAIN_PATCH_SIZE,
+        'training_batch_size': params.batch_size,
         # UNet model architecture parameters:
         'unet_in_channels': model.in_channels,
         'unet_out_channels': model.out_channels,
