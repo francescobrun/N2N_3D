@@ -14,5 +14,4 @@ numpy
 
 # Progress bars and utilities
 tqdm
-
 psutil
