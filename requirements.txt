@@ -3,7 +3,6 @@
 # Visit https://pytorch.org/get-started/locally/ for CUDA-specific installation commands
 torch
 torchvision
-torchaudio
 
 # Medical image processing and deep learning
 monai
@@ -15,4 +14,5 @@ numpy
 
 # Progress bars and utilities
 tqdm
+
 psutil
