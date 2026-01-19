@@ -13,7 +13,7 @@ If you use this code in your research, please cite the following article: https:
 
 ## 📋 Installation
 
-The only less common library used in this repository is MONAI (https://project-monai.github.io/). All other dependencies are trivial and are reported in requirements.txt.
+The only less common library used in this repository is MONAI (https://project-monai.github.io/). All other dependencies are trivial and are reported in [requirements.txt](requirements.txt).
 
 ```bash
 # Clone the repository
@@ -142,4 +142,5 @@ Code was restructured with inspiration from the SSD_3D repository (https://githu
 ---
 
 **Note**: This implementation is specifically designed for 3D images. For 2D images, please consider other repositories.
+
 
