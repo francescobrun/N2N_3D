@@ -140,7 +140,7 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> torch.nn.Mo
         raise RuntimeError(f"Failed to load checkpoint: {e}")
 
 def save_output(volume: np.ndarray, output_dir: Path, network_params: dict, 
-                use_tta: bool, overlap: float,
+                use_tta: bool, overlap: float, batch_size: int, cuda_device: int,
                 compression: bool = True, multilayer: bool = True, filename: str = "output_multilayer.tif",
                 input_json_path: str = None, checkpoint_file: str = None) -> None:
     """
@@ -593,7 +593,7 @@ def main(args) -> None:
         multilayer = output_path.suffix.lower() == '.tif'
         
         save_output(pred_volume, output_dir, network_params, 
-                   args.use_tta, args.overlap,
+                   args.use_tta, args.overlap, args.batch_size, cuda_device,
                    args.compression, multilayer, output_path.name, 
                    args.input_json, checkpoint_path)   
 
@@ -614,7 +614,7 @@ if __name__ == "__main__":
     parse.add_argument('input_json', help='Path to JSON file containing input/output paths and checkpoint directory')
     
     # Optional arguments with default values
-    parse.add_argument('--batch_size', default=32, type=int, help='The number of patches per batch')
+    parse.add_argument('--batch_size', default=4, type=int, help='The number of patches per batch')
     parse.add_argument('--cuda_device', default=0, type=int, help="CUDA device to use (default: 0)")
     parse.add_argument('--no_tta', action='store_true', help='Disable Test-Time Augmentation (default: enabled)')
     parse.add_argument('--overlap', default=0.75, type=float, help='Overlap ratio between patches for sliding window inference')
