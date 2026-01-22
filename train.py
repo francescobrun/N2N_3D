@@ -388,6 +388,7 @@ def main(params):
     optimizer = torch.optim.Adam(model.parameters(), weight_decay=WEIGHT_DECAY, lr=LEARNING_RATE)
 
     # Save the training parameters including normalization statistics
+    params_dict = dict(vars(params))
     params_dict.update({
         # Data parameters:  
         'normalization_mean': float(train_dataset.mean),
