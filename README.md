@@ -98,10 +98,10 @@ python inference.py path/to/your/config.json
 - `--batch_size`: Number of patches processed simultaneously (default: 4)
 - `--cuda_device`: CUDA device to use (default: 0)
 - `--no_tta`: Disable Test-Time Augmentation (default: enabled)
-- `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.75)
+- `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.8)
 - `--no_compression`: Disable compression in output TIFF files (default: enabled)
 
-**Note**: `norm_division_factor` is automatically loaded from the training parameters saved in `params.json` to ensure consistency with the trained model.
+**Note**: `norm_division_factor` is automatically loaded from the training parameters to ensure consistency with the trained model.
 
 #### Examples:
 
@@ -137,11 +137,12 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🙏 Acknowledgments
 
-Code was restructured with inspiration from the SSD_3D repository (https://github.com/xni-esrf/SSD_3D)
+Code was restructured with heavy inspiration from the SSD_3D repository (https://github.com/xni-esrf/SSD_3D)
 
 ---
 
 **Note**: This implementation is specifically designed for 3D images. For 2D images, please consider other repositories.
+
 
 
 
