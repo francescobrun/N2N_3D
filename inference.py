@@ -617,7 +617,7 @@ if __name__ == "__main__":
     parse.add_argument('--batch_size', default=4, type=int, help='The number of patches per batch')
     parse.add_argument('--cuda_device', default=0, type=int, help="CUDA device to use (default: 0)")
     parse.add_argument('--no_tta', action='store_true', help='Disable Test-Time Augmentation (default: enabled)')
-    parse.add_argument('--overlap', default=0.75, type=float, help='Overlap ratio between patches for sliding window inference')
+    parse.add_argument('--overlap', default=0.8, type=float, help='Overlap ratio between patches for sliding window inference')
     parse.add_argument('--no_compression', action='store_true', help='Disable compression in output TIFF files (default: enabled)')
     
     args = parse.parse_args()
@@ -627,3 +627,4 @@ if __name__ == "__main__":
     args.compression = not args.no_compression
     
     main(args)
+
