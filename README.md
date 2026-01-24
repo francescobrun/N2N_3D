@@ -62,7 +62,7 @@ python train.py path/to/your/config.json
 - `--nb_train_epoch`: Number of training epochs (default: 50)
 - `--batch_size`: Number of patches per batch (default: 32)
 - `--cuda_device`: CUDA device to use (default: 0)
-- `--norm_division_factor`: Division factor for group normalization (default: 1)
+- `--norm_division_factor`: Division factor for group normalization (default: 1, i.e. "instance")
 
 #### Examples:
 
@@ -142,5 +142,6 @@ Code was restructured with inspiration from the SSD_3D repository (https://githu
 ---
 
 **Note**: This implementation is specifically designed for 3D images. For 2D images, please consider other repositories.
+
 
 
