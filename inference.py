@@ -590,7 +590,7 @@ def main(args) -> None:
         output_dir = output_path.parent
         
         # Determine if output should be multilayer based on file extension
-        multilayer = output_path.suffix.lower() == '.tif'
+        multilayer = output_path.suffix.lower() in {'.tif', '.tiff'}
         
         save_output(pred_volume, output_dir, network_params, 
                    args.use_tta, args.overlap, args.batch_size, cuda_device,
