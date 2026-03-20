@@ -390,11 +390,11 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
             logging.info(f"    Overlap: {overlap:.3f} ({int(overlap*100)}% overlap between patches)")
             
             # Pad input volume to avoid edge artifacts
-            logging.info(f"    Padding: {pad_d}×{pad_h}×{pad_w} per side (reflect mode)")
+            logging.info(f"    Padding: {pad_d}×{pad_h}×{pad_w} per side (replicate mode)")
             test_volume = torch.nn.functional.pad(
                 test_volume,
                 (pad_w, pad_w, pad_h, pad_h, pad_d, pad_d),
-                mode='reflect'
+                mode='replicate'
             )
             
             if use_tta:
@@ -454,7 +454,7 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
                 predictor=predictor,
                 overlap=overlap,
                 mode="gaussian",
-                padding_mode="reflect",
+                padding_mode="replicate",
                 sw_device=next(model.parameters()).device, 
                 device=torch.device("cpu"),
                 progress=True,
