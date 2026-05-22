@@ -1,7 +1,6 @@
 import json
+import itertools
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import gc
 import psutil
 import numpy as np
@@ -30,47 +29,30 @@ WEIGHT_DECAY = 0.0  # Weight decay coefficient for L2 regularization
 
 
 # ============================================================================
-# SIMPLE LOSS FUNCTIONS
-# ============================================================================
-
-class TVLoss(nn.Module):
-    """
-    Total Variation Loss - encourages smoothness while preserving edges.
-    Very lightweight and computationally efficient.
-    """
-    
-    def __init__(self):
-        super().__init__()
-        
-    def forward(self, pred):
-        # Calculate total variation in all 3 spatial dimensions
-        tv_h = torch.mean(torch.abs(pred[:, :, 1:, :, :] - pred[:, :, :-1, :, :]))
-        tv_w = torch.mean(torch.abs(pred[:, :, :, 1:, :] - pred[:, :, :, :-1, :]))
-        tv_d = torch.mean(torch.abs(pred[:, :, :, :, 1:] - pred[:, :, :, :, :-1]))
-        return tv_h + tv_w + tv_d
-
-
-class CombinedL1WithTV(nn.Module):
-    """
-    Simple combined loss: L1 + TV regularization
-    """
-    
-    def __init__(self, tv_weight=0.01):
-        super().__init__()
-        self.tv_weight = tv_weight
-        self.l1_loss = nn.L1Loss()
-        self.tv_loss = TVLoss()
-        
-    def forward(self, pred, target):
-        l1 = self.l1_loss(pred, target)
-        tv = self.tv_loss(pred)
-        total = l1 + self.tv_weight * tv
-        return total, l1, tv
-
-
-# ============================================================================
 # CUSTOM TRANSFORMS AND DATASET CLASSES
 # ============================================================================
+
+def _cube_rotation_group():
+    """Return the 24 proper rotations of the cube as (axes_perm, sign_flips).
+
+    Each element is a signed permutation matrix. Filtering signed permutations
+    by determinant = +1 yields exactly the rotation group (chiral octahedral
+    group, order 24). No duplicates, no reflections.
+    """
+    rotations = []
+    for perm in itertools.permutations((0, 1, 2)):
+        inversions = sum(
+            1 for i in range(3) for j in range(i + 1, 3) if perm[i] > perm[j]
+        )
+        perm_sign = 1 if inversions % 2 == 0 else -1
+        for signs in itertools.product((1, -1), repeat=3):
+            if perm_sign * signs[0] * signs[1] * signs[2] == 1:
+                rotations.append((perm, signs))
+    assert len(rotations) == 24
+    return rotations
+
+
+CUBE_ROTATIONS = _cube_rotation_group()
 
 class CubeSymmetryTransform(tio.Transform):
     """
@@ -82,46 +64,9 @@ class CubeSymmetryTransform(tio.Transform):
     Uses explicit permutation matrices for maximum robustness and performance.
     """
     
-    # Predefined 24 rotation matrices as permutation indices for (D, H, W) axes
-    CUBE_ROTATIONS = [
-        # Identity rotations (4 orientations around Z-axis)
-        [(0, 1, 2), (1, -1, -1)],  # 0° around Z
-        [(0, 2, 1), (1, -1, 1)],   # 90° around Z  
-        [(0, 1, 2), (1, 1, 1)],    # 180° around Z
-        [(0, 2, 1), (1, 1, -1)],   # 270° around Z
-        
-        # Rotations around X-axis (4 orientations)
-        [(2, 1, 0), (-1, -1, 1)],  # 90° around X
-        [(1, 0, 2), (-1, 1, 1)],   # 180° around X
-        [(2, 1, 0), (1, -1, -1)],  # 270° around X
-        [(1, 0, 2), (1, 1, -1)],   # Additional X orientation
-        
-        # Rotations around Y-axis (4 orientations)
-        [(0, 2, 1), (1, 1, -1)],   # 90° around Y
-        [(2, 1, 0), (1, -1, 1)],   # 180° around Y
-        [(0, 2, 1), (1, -1, 1)],   # 270° around Y
-        [(2, 0, 1), (-1, 1, 1)],   # Additional Y orientation
-        
-        # Face-to-face rotations (8 orientations)
-        [(1, 2, 0), (1, -1, -1)],  # Face X->Y
-        [(2, 0, 1), (-1, 1, -1)],  # Face Y->Z
-        [(0, 1, 2), (-1, 1, 1)],   # Face Z->X
-        [(2, 1, 0), (1, 1, 1)],    # Face X->Z
-        [(1, 0, 2), (-1, -1, 1)],  # Face Y->X
-        [(0, 2, 1), (-1, -1, -1)], # Face Z->Y
-        [(1, 2, 0), (-1, 1, 1)],   # Face X->-Y
-        [(2, 0, 1), (1, -1, -1)],  # Face Y->-Z
-        
-        # Additional unique orientations (4)
-        [(2, 1, 0), (-1, 1, -1)],  # Diagonal 1
-        [(1, 2, 0), (1, 1, -1)],   # Diagonal 2
-        [(0, 2, 1), (-1, 1, -1)],  # Diagonal 3
-        [(2, 0, 1), (1, 1, 1)],    # Diagonal 4
-    ]
-    
     def _apply_rotation(self, tensor, rotation_idx):
         """Apply a specific rotation using permutation indices."""
-        axes_perm, flip_dirs = self.CUBE_ROTATIONS[rotation_idx]
+        axes_perm, flip_dirs = CUBE_ROTATIONS[rotation_idx]
         
         # Apply axis permutation
         tensor = tensor.permute(axes_perm)
@@ -212,12 +157,25 @@ class N2IDataset(Dataset):
             combined_data = np.concatenate([self.split1_volume.flatten(), self.split2_volume.flatten()])
             self.mean = np.float32(combined_data.mean())
             self.std = np.float32(combined_data.std())
-    
+            del combined_data
+
+        # Move volumes to shared memory so DataLoader workers do not duplicate them
+        # across processes (important on Windows where spawn-mode workers would
+        # otherwise pickle a full copy of each volume per worker).
+        self.split1_volume = torch.from_numpy(self.split1_volume)
+        self.split2_volume = torch.from_numpy(self.split2_volume)
+        self.split1_volume.share_memory_()
+        self.split2_volume.share_memory_()
+
+        # Reused for every __getitem__ call; the transform is stateless (random
+        # state is sampled fresh inside apply_transform).
+        self.transform = CubeSymmetryTransform()
+
     def _load_patch(self, volume, start_coords):
         """Extract a patch from preloaded volume."""
         x, y, z = start_coords
-        patch = volume[x:x+self.patch_size[0], y:y+self.patch_size[1], z:z+self.patch_size[2]].copy()
-        return np.expand_dims(patch, 0)  # Add channel dimension
+        patch = volume[x:x+self.patch_size[0], y:y+self.patch_size[1], z:z+self.patch_size[2]].clone()
+        return patch.unsqueeze(0)  # Add channel dimension
     
     def __len__(self):
         return self.nb_patches
@@ -232,32 +190,38 @@ class N2IDataset(Dataset):
         start_y = np.random.randint(0, max_y + 1) + self.sampling_offset[1]
         start_z = np.random.randint(0, max_z + 1) + self.sampling_offset[2]
         
-        # Load patches from preloaded volumes
+        # Load patches from preloaded volumes (returns float32 torch tensors)
         patch1 = self._load_patch(self.split1_volume, (start_x, start_y, start_z))
         patch2 = self._load_patch(self.split2_volume, (start_x, start_y, start_z))
-        
+
         # Apply normalization if needed
         if self.normalization:
             patch1 = (patch1 - self.mean) / (self.std + 1e-7)
             patch2 = (patch2 - self.mean) / (self.std + 1e-7)
-        
-        # Convert to tensors
-        patch1 = torch.from_numpy(patch1).float()
-        patch2 = torch.from_numpy(patch2).float()
-        
+
         # Apply cube symmetry transform
-        transform = CubeSymmetryTransform()
         subject = tio.Subject(
             split1_volume=tio.ScalarImage(tensor=patch1),
             split2_volume=tio.ScalarImage(tensor=patch2)
         )
-        subject = transform(subject)
+        subject = self.transform(subject)
         
         return {
             'split1_volume': subject['split1_volume'],
             'split2_volume': subject['split2_volume']
         }
 
+
+
+def _worker_init_fn(worker_id):
+    """Seed numpy independently in each DataLoader worker.
+
+    Without this, every worker inherits the same numpy RNG state and the random
+    patch coordinates in __getitem__ end up correlated across workers. PyTorch
+    already seeds its own and Python's RNGs per worker; we only need to forward
+    that to numpy.
+    """
+    np.random.seed(torch.initial_seed() % 2**32)
 
 
 def save_model(model, optimizer, epoch, save_path):
@@ -280,7 +244,7 @@ def train_model(dl, model, loss_func, optimizer,
     # Load checkpoint if specified
     if loaded_checkpoint_path is not None:
         print("Loading weights...")
-        state = torch.load(loaded_checkpoint_path, map_location=torch.device(device))
+        state = torch.load(loaded_checkpoint_path, map_location=torch.device(device), weights_only=True)
         model.load_state_dict(state['state_dict'])
         optimizer.load_state_dict(state['optimizer'])
         start_epoch_nb = state['epoch']+1
@@ -291,32 +255,28 @@ def train_model(dl, model, loss_func, optimizer,
         epoch_loss = 0
         
         for batch in tqdm(dl, desc=f'Epoch {epoch+1}/{nb_train_epoch}'):
-            # Constitute input and target with volumes extracted from split1_volume and split2_volume
-            input = torch.cat([batch["split1_volume"][tio.DATA][0:dl.batch_size//2], batch["split2_volume"][tio.DATA][dl.batch_size//2:]], 0)
-            target = torch.cat([batch["split2_volume"][tio.DATA][0:dl.batch_size//2], batch["split1_volume"][tio.DATA][dl.batch_size//2:]], 0)
-
-            input, target = input.to(device), target.to(device)
-
-            # Shuffle element in batch
-            random_perm = torch.randperm(dl.batch_size)
-            input, target = input[random_perm], target[random_perm]
+            # Per-sample: with 50% probability swap which noisy copy is input vs. target
+            data1 = batch["split1_volume"][tio.DATA].to(device)
+            data2 = batch["split2_volume"][tio.DATA].to(device)
+            swap = (torch.rand(data1.shape[0], device=device) < 0.5).view(-1, 1, 1, 1, 1)
+            input = torch.where(swap, data2, data1)
+            target = torch.where(swap, data1, data2)
             
             # Proceed to a training step
             optimizer.zero_grad()
             pred = model(input)
             
-            # Use MSE loss
+            # Use MSE loss. Loss is scaled by 1000 to counteract Adam's eps=1e-8
+            # damping the update when gradients are small (z-score-normalized
+            # inputs + MSE produce tiny gradient magnitudes). Equivalent to
+            # using eps=1e-11; the scaling form is kept for numerical safety.
             total_loss = loss_func(pred, target)
             loss_val = total_loss * 1000
             
             loss_val.backward()
             optimizer.step()
-            epoch_loss += loss_val / len(dl)
+            epoch_loss += loss_val.item() / len(dl)
 
-            # Clean up batch from memory
-            del input, target
-            torch.cuda.empty_cache()
-            
         print(f"Mean loss value of the epoch : {epoch_loss:.4f}")
         
         # Show memory monitoring only after first epoch
@@ -380,7 +340,9 @@ def main(params):
         batch_size=params.batch_size,
         shuffle=True,
         drop_last=True,
-        num_workers=0 
+        num_workers=params.num_workers,
+        persistent_workers=params.num_workers > 0,
+        worker_init_fn=_worker_init_fn if params.num_workers > 0 else None,
     )
 
     # Create loss function and optimizer
@@ -442,5 +404,6 @@ if __name__ == "__main__":
     parse.add_argument('--batch_size', default=32, type=int, help="The number of patch per batch")
     parse.add_argument('--cuda_device', default=0, type=int, help="CUDA device to use (default: 0)")
     parse.add_argument('--norm_division_factor', default=1, type=int, help="Division factor for group normalization (1=instance norm, 56=layer norm)")
+    parse.add_argument('--num_workers', default=4, type=int, help="Number of DataLoader worker processes (default: 4; use 0 on very low-RAM systems)")
 
     main(parse.parse_args())

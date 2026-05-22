@@ -44,7 +44,7 @@ Prepare your three multi-layer TIFF files and choose an empty folder to store ch
 ```
 **Note**: In principle, `test` can also be the same file as `split1` or `split2`.
 
-**Note**: It is implicit that `split1`, `split2`, and `test` files should have the same number of voxels organized in the same N×M×P dimensions. 
+**Note**: `split1` and `split2` must have identical dimensions (they're the two noisy copies of the same content). `test` can be a different size — for example, a cropped training pair with a full-volume test image.
 
 **Note**: It is not required that the volumes are perfect cubes of N×N×N voxels.
 
@@ -97,8 +97,8 @@ python inference.py path/to/your/config.json
 
 - `--batch_size`: Number of patches processed simultaneously (default: 4)
 - `--cuda_device`: CUDA device to use (default: 0)
-- `--no_tta`: Disable Test-Time Augmentation (default: enabled)
-- `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.8)
+- `--tta`: Enable Test-Time Augmentation (default: disabled)
+- `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.85)
 - `--no_compression`: Disable compression in output TIFF files (default: enabled)
 
 **Note**: `norm_division_factor` is automatically loaded from the training parameters to ensure consistency with the trained model.
@@ -112,8 +112,8 @@ python inference.py config.json
 # Inference with larger batch size (uses more memory)
 python inference.py config.json --batch_size 8
 
-# Inference without Test-Time Augmentation (faster but potentially lower quality)
-python inference.py config.json --no_tta
+# Inference with Test-Time Augmentation (slower but potentially higher quality)
+python inference.py config.json --tta
 
 # Inference with custom overlap (lower overlap = less quality but faster)
 python inference.py config.json --overlap 0.5

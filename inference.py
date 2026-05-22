@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import json
+import itertools
 import tifffile
 import logging
 import psutil
@@ -19,6 +20,65 @@ warnings.filterwarnings(
     "ignore",
     message="Using a non-tuple sequence for multidimensional indexing is deprecated"
 )
+
+
+# ============================================================================
+# TEST-TIME AUGMENTATION HELPERS
+# ============================================================================
+# The 24 proper rotations of the cube, used by TTA to average predictions over
+# all orientations the model was trained to be invariant to. Duplicated from
+# train.py rather than imported to keep inference.py self-contained (the
+# rotation group is a fixed mathematical object that won't change).
+
+def _cube_rotation_group():
+    """Return the 24 proper rotations of the cube as (axes_perm, sign_flips)."""
+    rotations = []
+    for perm in itertools.permutations((0, 1, 2)):
+        inversions = sum(
+            1 for i in range(3) for j in range(i + 1, 3) if perm[i] > perm[j]
+        )
+        perm_sign = 1 if inversions % 2 == 0 else -1
+        for signs in itertools.product((1, -1), repeat=3):
+            if perm_sign * signs[0] * signs[1] * signs[2] == 1:
+                rotations.append((perm, signs))
+    assert len(rotations) == 24
+    return rotations
+
+
+CUBE_ROTATIONS = _cube_rotation_group()
+
+
+def _rotate_5d(tensor: torch.Tensor, axes_perm, sign_flips) -> torch.Tensor:
+    """Apply a cube rotation to a (B, C, D, H, W) tensor.
+
+    Permutes the three spatial axes by `axes_perm`, then flips each spatial
+    axis where the corresponding `sign_flips` entry is -1. This matches the
+    convention used in train.py's CubeSymmetryTransform._apply_rotation.
+    """
+    perm = (0, 1, axes_perm[0] + 2, axes_perm[1] + 2, axes_perm[2] + 2)
+    tensor = tensor.permute(perm)
+    flip_dims = tuple(i + 2 for i, s in enumerate(sign_flips) if s == -1)
+    if flip_dims:
+        tensor = tensor.flip(flip_dims)
+    return tensor
+
+
+def _invert_rotation_5d(tensor: torch.Tensor, axes_perm, sign_flips) -> torch.Tensor:
+    """Undo a rotation applied by _rotate_5d.
+
+    Forward is permute-then-flip; inverse is flip-then-inverse-permute. Axis
+    flips are self-inverse, so the flip step uses the same axes (still in the
+    post-permute frame).
+    """
+    flip_dims = tuple(i + 2 for i, s in enumerate(sign_flips) if s == -1)
+    if flip_dims:
+        tensor = tensor.flip(flip_dims)
+    inv_perm = [0, 0, 0]
+    for i, p in enumerate(axes_perm):
+        inv_perm[p] = i
+    perm = (0, 1, inv_perm[0] + 2, inv_perm[1] + 2, inv_perm[2] + 2)
+    tensor = tensor.permute(perm)
+    return tensor
 
 def setup_logging() -> None:
     """
@@ -112,8 +172,14 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> torch.nn.Mo
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
     
     try:
-        # Load weights
-        state = torch.load(checkpoint_path)
+        # Load weights onto the model's current device; weights_only=True is
+        # safe here (checkpoints contain only state_dict + optimizer tensors)
+        # and silences the PyTorch 2.6+ FutureWarning.
+        state = torch.load(
+            checkpoint_path,
+            map_location=next(model.parameters()).device,
+            weights_only=True,
+        )
         state_dict = state["state_dict"]
         
         # Handle DataParallel key mismatch:
@@ -398,49 +464,22 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
             )
             
             if use_tta:
-                logging.info("    Using Test-Time Augmentation...")
-                # Create TTA predictor function
+                logging.info(f"    Using Test-Time Augmentation ({len(CUBE_ROTATIONS)} rotations of the cube)...")
+
                 def tta_predictor(x):
-                    # TTA transforms
-                    tta_transforms = [
-                        ('none', None, None),           # 0. Identity
-                        ('rot180', [3, 4], None),       # 1. 180° rotation H-W plane
-                        ('flip', [2], None),            # 2. Flip D (depth)
-                        ('flip', [3], None),            # 3. Flip H (height)
-                        ('flip', [4], None),            # 4. Flip W (width)
-                        ('rot180', [2, 3], None),       # 5. 180° rotation D-H plane
-                        ('rot180', [2, 4], None),       # 6. 180° rotation D-W plane
-                        ('flip', [3, 4], None),         # 7. Flip both H and W
-                    ]
-                    
-                    def apply_transform(x, transform_type, dims, k):
-                        if transform_type == 'none':
-                            return x
-                        elif transform_type == 'rot180':
-                            return torch.rot90(x, k=2, dims=dims)
-                        elif transform_type == 'flip':
-                            return torch.flip(x, dims=dims)
-                        return x
-                    
-                    def invert_transform(x, transform_type, dims, k):
-                        if transform_type == 'none':
-                            return x
-                        elif transform_type == 'rot180':
-                            return torch.rot90(x, k=2, dims=dims)
-                        elif transform_type == 'flip':
-                            return torch.flip(x, dims=dims)
-                        return x
-                    
-                    preds = []
+                    # Average predictions over the 24 proper rotations of the
+                    # cube, matching the training augmentation group. For each
+                    # rotation R, predict R(x), then apply R^-1 to bring the
+                    # prediction back into the canonical frame before averaging.
+                    acc = None
                     with torch.no_grad():
-                        for transform_type, dims, k in tta_transforms:
-                            x_aug = apply_transform(x, transform_type, dims, k)
+                        for axes_perm, sign_flips in CUBE_ROTATIONS:
+                            x_aug = _rotate_5d(x, axes_perm, sign_flips)
                             pred = model(x_aug)
-                            pred = invert_transform(pred, transform_type, dims, k)
-                            preds.append(pred)
-                    
-                    return torch.stack(preds, dim=0).mean(dim=0)
-                
+                            pred = _invert_rotation_5d(pred, axes_perm, sign_flips)
+                            acc = pred if acc is None else acc + pred
+                    return acc / len(CUBE_ROTATIONS)
+
                 predictor = tta_predictor
             else:
                 logging.info("    Test-Time Augmentation not applied...")
@@ -461,7 +500,7 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
             )
             
             if use_tta:
-                logging.info(f"TTA completed with 8 transforms (all flips and 180° rotations)")
+                logging.info(f"TTA completed with {len(CUBE_ROTATIONS)} rotations of the cube")
             
             # Crop padding from output
             if pad_d > 0 or pad_h > 0 or pad_w > 0:
@@ -616,14 +655,14 @@ if __name__ == "__main__":
     # Optional arguments with default values
     parse.add_argument('--batch_size', default=4, type=int, help='The number of patches per batch')
     parse.add_argument('--cuda_device', default=0, type=int, help="CUDA device to use (default: 0)")
-    parse.add_argument('--no_tta', action='store_true', help='Disable Test-Time Augmentation (default: enabled)')
+    parse.add_argument('--tta', action='store_true', help='Enable Test-Time Augmentation (default: disabled)')
     parse.add_argument('--overlap', default=0.85, type=float, help='Overlap ratio between patches for sliding window inference')
     parse.add_argument('--no_compression', action='store_true', help='Disable compression in output TIFF files (default: enabled)')
     
     args = parse.parse_args()
     
     # Handle flag logic (default to True, disable if flag is set)
-    args.use_tta = not args.no_tta
+    args.use_tta = args.tta
     args.compression = not args.no_compression
     
     main(args)
