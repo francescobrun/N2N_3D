@@ -80,6 +80,8 @@ python train.py path/to/your/config.json
 
 **Note**: Training is designed to be executed overnight, which means that 50 epochs of training should take about 12 hours.
 
+**Note**: Alongside the per-epoch checkpoints, training writes a `training_loss.csv` file in the checkpoint directory with one row per epoch (`epoch,mean_loss`). Useful for plotting the loss curve afterward and judging whether more epochs would help.
+
 #### Optional Arguments:
 
 - `--loaded_checkpoint_path`: Path to a checkpoint file to resume training from (default: None)
@@ -88,6 +90,7 @@ python train.py path/to/your/config.json
 - `--cuda_device`: CUDA device to use (default: 0)
 - `--norm_division_factor`: Division factor for group normalization (default: 1, i.e. "instance")
 - `--no_half`: Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0). Automatically skipped on older cards (GTX 10-series / Pascal) where fp16 would be slower than fp32.
+- `--keep_only_last`: Keep only the most recent epoch's checkpoint on disk; the previous epoch's `weights_epoch_NNN.torch` is deleted after each save (default: every epoch is preserved, useful for testing/ablation).
 
 #### Examples:
 

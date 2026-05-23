@@ -329,7 +329,7 @@ def save_model(model, optimizer, epoch, save_path):
 
 def train_model(dl, model, loss_func, optimizer,
                 checkpoint_dir, loaded_checkpoint_path, nb_train_epoch, device,
-                use_amp):
+                use_amp, keep_only_last):
     """Train the model with logic similar to train_old.py."""
 
     start_epoch_nb = 0
@@ -345,6 +345,17 @@ def train_model(dl, model, loss_func, optimizer,
     # GradScaler prevents fp16 gradient underflow during backward. When
     # use_amp=False it's a no-op (passes through scale/step/update calls).
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    # Per-epoch loss log, appended live so the curve survives interruptions
+    # and is recoverable for plateau-detection / plotting after training.
+    # On resume (start_epoch_nb > 0) we append to the existing file; on a
+    # fresh run we (re)write the header.
+    loss_csv_path = checkpoint_dir / "training_loss.csv"
+    write_header = start_epoch_nb == 0 or not loss_csv_path.exists() or loss_csv_path.stat().st_size == 0
+    loss_csv = open(loss_csv_path, "w" if write_header else "a")
+    if write_header:
+        loss_csv.write("epoch,mean_loss\n")
+        loss_csv.flush()
 
     # Training loop
     first_epoch_completed = False
@@ -379,6 +390,8 @@ def train_model(dl, model, loss_func, optimizer,
             epoch_loss += loss_val.item() / len(dl)
 
         print(f"Mean loss value of the epoch : {epoch_loss:.4f}")
+        loss_csv.write(f"{epoch},{epoch_loss:.6f}\n")
+        loss_csv.flush()
         
         # Show memory monitoring only after first epoch
         if not first_epoch_completed and torch.cuda.is_available():
@@ -396,10 +409,22 @@ def train_model(dl, model, loss_func, optimizer,
         # Save checkpoint at each epoch
         print("Saving checkpoint for epoch n°{}...".format(epoch))
         save_model(model, optimizer, epoch, checkpoint_dir / f"weights_epoch_{epoch:03d}.torch")
+
+        # If keep_only_last is set, delete the previous epoch's checkpoint
+        # after the new one is safely on disk. Resume-from-checkpoint still
+        # works because the loaded_checkpoint_path argument is just a file
+        # path -- if the user re-runs and the file no longer exists, that's
+        # the same as any other missing-file error.
+        if keep_only_last:
+            prev_ckpt = checkpoint_dir / f"weights_epoch_{epoch - 1:03d}.torch"
+            if prev_ckpt.exists():
+                prev_ckpt.unlink()
         
         # Clear memory to prevent CUDA out of memory errors
         del epoch_loss
         gc.collect()
+
+    loss_csv.close()
 
 # ============================================================================
 # MAIN EXECUTION
@@ -514,6 +539,7 @@ def main(params):
         params.nb_train_epoch,
         device,
         use_amp,
+        params.keep_only_last,
     )
 
 
@@ -528,5 +554,6 @@ if __name__ == "__main__":
     parse.add_argument('--norm_division_factor', default=1, type=int, help="Division factor for group normalization (1=instance norm, 56=layer norm)")
     parse.add_argument('--num_workers', default=4, type=int, help="Number of DataLoader worker processes (default: 4; use 0 on very low-RAM systems)")
     parse.add_argument('--no_half', action='store_true', help="Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0)")
+    parse.add_argument('--keep_only_last', action='store_true', help="Keep only the most recent epoch's checkpoint on disk; delete previous ones after each save (default: keep every epoch)")
 
     main(parse.parse_args())
