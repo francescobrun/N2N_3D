@@ -425,8 +425,8 @@ def load_normalization_stats(checkpoint_path: str) -> Optional[Tuple[float, floa
 
 
 def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
-                   batch_size: int, train_patch_size: Tuple[int, int, int], 
-                   use_tta: bool, overlap: float) -> np.ndarray:
+                   batch_size: int, train_patch_size: Tuple[int, int, int],
+                   use_tta: bool, overlap: float, half: bool) -> np.ndarray:
     """
     Run inference on a preloaded volume using a trained denoising model.
     
@@ -462,7 +462,32 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
                 (pad_w, pad_w, pad_h, pad_h, pad_d, pad_d),
                 mode='replicate'
             )
-            
+
+            # fp16 autocast requires CUDA and a tensor-core-capable GPU
+            # (compute capability >= 7.0: Volta/Turing/Ampere/Ada/Hopper).
+            # On older cards (e.g. Pascal GTX 10-series) fp16 throughput is
+            # much lower than fp32, so autocast would slow inference down.
+            use_amp = False
+            if half and device.type == "cuda":
+                major, minor = torch.cuda.get_device_capability(device)
+                if major >= 7:
+                    use_amp = True
+                else:
+                    logging.info(
+                        f"    fp16 requested but disabled: GPU compute capability "
+                        f"{major}.{minor} lacks tensor cores; fp16 would run slower than fp32"
+                    )
+            logging.info(
+                f"    Mixed precision (fp16): {'enabled' if use_amp else 'disabled'}"
+            )
+
+            def _forward(x):
+                # Autocast wraps the forward pass; the output is cast back to
+                # fp32 so the sliding-window aggregation stays numerically clean.
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                    out = model(x)
+                return out.float()
+
             if use_tta:
                 logging.info(f"    Using Test-Time Augmentation ({len(CUBE_ROTATIONS)} rotations of the cube)...")
 
@@ -475,7 +500,7 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
                     with torch.no_grad():
                         for axes_perm, sign_flips in CUBE_ROTATIONS:
                             x_aug = _rotate_5d(x, axes_perm, sign_flips)
-                            pred = model(x_aug)
+                            pred = _forward(x_aug)
                             pred = _invert_rotation_5d(pred, axes_perm, sign_flips)
                             acc = pred if acc is None else acc + pred
                     return acc / len(CUBE_ROTATIONS)
@@ -483,7 +508,7 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
                 predictor = tta_predictor
             else:
                 logging.info("    Test-Time Augmentation not applied...")
-                predictor = model
+                predictor = _forward
             
             # Common sliding window inference
             pred_volume = sliding_window_inference(
@@ -558,6 +583,7 @@ def main(args) -> None:
         logging.info(f"    Batch size: {args.batch_size}")
         logging.info(f"    CUDA device: {args.cuda_device}")
         logging.info(f"    Test-Time Augmentation: {args.use_tta}")
+        logging.info(f"    Mixed precision (fp16): {args.half}")
         logging.info(f"    Overlap ratio: {args.overlap}")
         logging.info(f"    Compression: {args.compression}")
         
@@ -601,9 +627,9 @@ def main(args) -> None:
         
         # Run inference        
         logging.info("Running inference...")
-        pred_volume = _run_inference(model, test_volume, args.batch_size, 
-                                   tuple(network_params['train_patch_size']), 
-                                   args.use_tta, args.overlap)
+        pred_volume = _run_inference(model, test_volume, args.batch_size,
+                                   tuple(network_params['train_patch_size']),
+                                   args.use_tta, args.overlap, args.half)
 
         # GPU RAM memory monitoring:
         if torch.cuda.is_available():
@@ -656,14 +682,16 @@ if __name__ == "__main__":
     parse.add_argument('--batch_size', default=4, type=int, help='The number of patches per batch')
     parse.add_argument('--cuda_device', default=0, type=int, help="CUDA device to use (default: 0)")
     parse.add_argument('--tta', action='store_true', help='Enable Test-Time Augmentation (default: disabled)')
-    parse.add_argument('--overlap', default=0.85, type=float, help='Overlap ratio between patches for sliding window inference')
+    parse.add_argument('--overlap', default=0.8, type=float, help='Overlap ratio between patches for sliding window inference')
     parse.add_argument('--no_compression', action='store_true', help='Disable compression in output TIFF files (default: enabled)')
+    parse.add_argument('--no_half', action='store_true', help='Disable fp16 mixed precision inference (default: enabled when CUDA is available)')
     
     args = parse.parse_args()
     
     # Handle flag logic (default to True, disable if flag is set)
     args.use_tta = args.tta
     args.compression = not args.no_compression
+    args.half = not args.no_half
     
     main(args)
 

@@ -117,6 +117,41 @@ class CubeSymmetryTransform(tio.Transform):
         return subject
 
 
+def _parse_crop(crop, volume_shape):
+    """Validate and normalize the optional 'crop' entry from the JSON config.
+
+    Accepts a dict of the form {"x": [start, end], "y": [start, end], "z":
+    [start, end]} with half-open intervals in voxel coordinates (start
+    inclusive, end exclusive). Returns either None (no crop requested) or a
+    tuple of three (start, end) pairs in axis-0, axis-1, axis-2 order.
+    """
+    if crop is None:
+        return None
+    if not isinstance(crop, dict) or set(crop.keys()) != {"x", "y", "z"}:
+        raise ValueError(
+            f"'crop' must be a dict with exactly the keys 'x', 'y', 'z' (got {crop})"
+        )
+    ranges = []
+    for axis, axis_name in enumerate(("x", "y", "z")):
+        rng = crop[axis_name]
+        if not (isinstance(rng, (list, tuple)) and len(rng) == 2):
+            raise ValueError(
+                f"crop[{axis_name!r}] must be a 2-element [start, end] list (got {rng})"
+            )
+        start, end = int(rng[0]), int(rng[1])
+        if start < 0 or end <= start:
+            raise ValueError(
+                f"crop[{axis_name!r}] must satisfy 0 <= start < end (got [{start}, {end}])"
+            )
+        if end > volume_shape[axis]:
+            raise ValueError(
+                f"crop[{axis_name!r}] end={end} exceeds volume size "
+                f"{volume_shape[axis]} on axis {axis}"
+            )
+        ranges.append((start, end))
+    return tuple(ranges)
+
+
 class N2IDataset(Dataset):
     """
     Noise2Inverse dataset that preloads both volumes into memory for fast training.
@@ -136,13 +171,58 @@ class N2IDataset(Dataset):
         print("Loading training volumes into memory...")
         self.split1_volume = tifffile.imread(split1_path).astype(np.float32)
         self.split2_volume = tifffile.imread(split2_path).astype(np.float32)
-        
+
+        if self.split1_volume.shape != self.split2_volume.shape:
+            raise ValueError(
+                f"split1 and split2 must have identical shapes, got "
+                f"{self.split1_volume.shape} vs {self.split2_volume.shape}"
+            )
+
+        # Optional ROI cropping. When the JSON config defines a "crop" entry,
+        # both training volumes are sliced to that bounding box and everything
+        # downstream (normalization stats, patch sampling, diagnostics) sees
+        # only the cropped region. Inference is unaffected — it still runs on
+        # whatever test volume the config points to.
+        self.crop = _parse_crop(dataset_info.get("crop"), self.split1_volume.shape)
+        if self.crop is not None:
+            (x0, x1), (y0, y1), (z0, z1) = self.crop
+            self.split1_volume = self.split1_volume[x0:x1, y0:y1, z0:z1].copy()
+            self.split2_volume = self.split2_volume[x0:x1, y0:y1, z0:z1].copy()
+            print(
+                f"Applied training crop: x=[{x0},{x1}), y=[{y0},{y1}), z=[{z0},{z1}) "
+                f"-> shape {self.split1_volume.shape}"
+            )
+
         self.volume_shape = self.split1_volume.shape
-        
+
+        if any(vs < ps for vs, ps in zip(self.volume_shape, training_patch_size)):
+            raise ValueError(
+                f"Training volume shape {self.volume_shape} is smaller than the "
+                f"training patch size {tuple(training_patch_size)} in at least "
+                f"one dimension. Crop the volume less aggressively (every "
+                f"dimension must be >= {training_patch_size[0]} voxels) or "
+                f"reduce TRAIN_PATCH_SIZE in train.py."
+            )
+
+        # Diagnostic: report how heavily the volume is sampled per epoch.
+        # Heavy reuse (high ratio) on tiny volumes or vanishing coverage on huge
+        # volumes are both fine for N2N training but worth being aware of.
+        unique_positions = 1
+        for vs, ps in zip(self.volume_shape, training_patch_size):
+            unique_positions *= (vs - ps + 1)
+        print(
+            f"Volume size: {'×'.join(str(s) for s in self.volume_shape)}"
+        )
+        print(
+            f"Unique patch start positions: {unique_positions:.2e} "
+            f"(patches/epoch: {nb_patches}, coverage per epoch: "
+            f"{nb_patches / unique_positions:.2e})"
+        )
+
         # Always use full volume (no cropping)
         self.sampling_shape = self.volume_shape
         self.sampling_offset = (0, 0, 0)
-        
+
         self.patch_size = training_patch_size
         self.nb_patches = nb_patches
         self.normalization = normalization
@@ -235,12 +315,13 @@ def save_model(model, optimizer, epoch, save_path):
     torch.save(state, save_path, _use_new_zipfile_serialization=True)
 
 
-def train_model(dl, model, loss_func, optimizer, 
-                checkpoint_dir, loaded_checkpoint_path, nb_train_epoch, device):
+def train_model(dl, model, loss_func, optimizer,
+                checkpoint_dir, loaded_checkpoint_path, nb_train_epoch, device,
+                use_amp):
     """Train the model with logic similar to train_old.py."""
-    
+
     start_epoch_nb = 0
-    
+
     # Load checkpoint if specified
     if loaded_checkpoint_path is not None:
         print("Loading weights...")
@@ -249,11 +330,15 @@ def train_model(dl, model, loss_func, optimizer,
         optimizer.load_state_dict(state['optimizer'])
         start_epoch_nb = state['epoch']+1
 
-    # Training loop    
+    # GradScaler prevents fp16 gradient underflow during backward. When
+    # use_amp=False it's a no-op (passes through scale/step/update calls).
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    # Training loop
     first_epoch_completed = False
     for epoch in range(start_epoch_nb, nb_train_epoch):
         epoch_loss = 0
-        
+
         for batch in tqdm(dl, desc=f'Epoch {epoch+1}/{nb_train_epoch}'):
             # Per-sample: with 50% probability swap which noisy copy is input vs. target
             data1 = batch["split1_volume"][tio.DATA].to(device)
@@ -261,20 +346,24 @@ def train_model(dl, model, loss_func, optimizer,
             swap = (torch.rand(data1.shape[0], device=device) < 0.5).view(-1, 1, 1, 1, 1)
             input = torch.where(swap, data2, data1)
             target = torch.where(swap, data1, data2)
-            
+
             # Proceed to a training step
             optimizer.zero_grad()
-            pred = model(input)
-            
-            # Use MSE loss. Loss is scaled by 1000 to counteract Adam's eps=1e-8
-            # damping the update when gradients are small (z-score-normalized
-            # inputs + MSE produce tiny gradient magnitudes). Equivalent to
-            # using eps=1e-11; the scaling form is kept for numerical safety.
-            total_loss = loss_func(pred, target)
-            loss_val = total_loss * 1000
-            
-            loss_val.backward()
-            optimizer.step()
+
+            # Forward + loss inside autocast; the ×1000 scaling composes with
+            # GradScaler's dynamic scaling — both survive the backward pass.
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                pred = model(input)
+                # Use MSE loss. Loss is scaled by 1000 to counteract Adam's eps=1e-8
+                # damping the update when gradients are small (z-score-normalized
+                # inputs + MSE produce tiny gradient magnitudes). Equivalent to
+                # using eps=1e-11; the scaling form is kept for numerical safety.
+                total_loss = loss_func(pred, target)
+                loss_val = total_loss * 1000
+
+            scaler.scale(loss_val).backward()
+            scaler.step(optimizer)
+            scaler.update()
             epoch_loss += loss_val.item() / len(dl)
 
         print(f"Mean loss value of the epoch : {epoch_loss:.4f}")
@@ -321,6 +410,24 @@ def main(params):
     else:
         device = torch.device("cpu")
         print("CUDA not available, using CPU")
+
+    # fp16 mixed-precision training requires CUDA and a tensor-core-capable
+    # GPU (compute capability >= 7.0: Volta/Turing/Ampere/Ada/Hopper). On
+    # older cards (e.g. Pascal GTX 10-series) fp16 throughput is much lower
+    # than fp32, so autocast would slow training down.
+    use_amp = False
+    if not params.no_half and device.type == "cuda":
+        major, minor = torch.cuda.get_device_capability(device)
+        if major >= 7:
+            use_amp = True
+            print(f"Mixed precision (fp16): enabled (compute capability {major}.{minor})")
+        else:
+            print(
+                f"Mixed precision (fp16): disabled — GPU compute capability "
+                f"{major}.{minor} lacks tensor cores; fp16 would run slower than fp32"
+            )
+    else:
+        print("Mixed precision (fp16): disabled")
     
     # Initialize the model to be trained
     model = create_model(device=params.cuda_device if torch.cuda.is_available() else 'cpu',
@@ -366,6 +473,8 @@ def main(params):
         'nb_train_epoch': params.nb_train_epoch,
         'training_cuda_device': params.cuda_device,
         'training_batch_size': params.batch_size,
+        'training_mixed_precision': use_amp,
+        'training_crop': train_dataset.crop,
         # UNet model architecture parameters:
         'unet_in_channels': model.in_channels,
         'unet_out_channels': model.out_channels,
@@ -391,7 +500,8 @@ def main(params):
         checkpoint_dir,
         params.loaded_checkpoint_path,
         params.nb_train_epoch,
-        device
+        device,
+        use_amp,
     )
 
 
@@ -405,5 +515,6 @@ if __name__ == "__main__":
     parse.add_argument('--cuda_device', default=0, type=int, help="CUDA device to use (default: 0)")
     parse.add_argument('--norm_division_factor', default=1, type=int, help="Division factor for group normalization (1=instance norm, 56=layer norm)")
     parse.add_argument('--num_workers', default=4, type=int, help="Number of DataLoader worker processes (default: 4; use 0 on very low-RAM systems)")
+    parse.add_argument('--no_half', action='store_true', help="Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0)")
 
     main(parse.parse_args())

@@ -48,6 +48,28 @@ Prepare your three multi-layer TIFF files and choose an empty folder to store ch
 
 **Note**: It is not required that the volumes are perfect cubes of N×N×N voxels.
 
+**Optional ROI crop**: an additional `crop` entry can restrict training to a
+bounding box within `split1`/`split2`. Useful when the volume contains a
+region you do not want to spend network capacity on (e.g. skull around a
+brain, air around a sample). Coordinates are half-open `[start, end)` voxel
+ranges; axes are `x` → axis 0, `y` → axis 1, `z` → axis 2. Inference is
+unaffected — the test volume is processed as-is.
+
+```json
+{
+    "split1_volume_file": "path/to/your/volume_part1.tif",
+    "split2_volume_file": "path/to/your/volume_part2.tif",
+    "checkpoint_path": "path/to/checkpoints/",
+    "test_volume_file": "path/to/your/volume_full.tif",
+    "output_file": "path/to/output/denoised.tif",
+    "crop": {
+        "x": [100, 500],
+        "y": [50, 450],
+        "z": [200, 800]
+    }
+}
+```
+
 ### 2. Train the Model
 
 ```bash
@@ -63,6 +85,7 @@ python train.py path/to/your/config.json
 - `--batch_size`: Number of patches per batch (default: 32)
 - `--cuda_device`: CUDA device to use (default: 0)
 - `--norm_division_factor`: Division factor for group normalization (default: 1, i.e. "instance")
+- `--no_half`: Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0). Automatically skipped on older cards (GTX 10-series / Pascal) where fp16 would be slower than fp32.
 
 #### Examples:
 
@@ -98,8 +121,9 @@ python inference.py path/to/your/config.json
 - `--batch_size`: Number of patches processed simultaneously (default: 4)
 - `--cuda_device`: CUDA device to use (default: 0)
 - `--tta`: Enable Test-Time Augmentation (default: disabled)
-- `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.85)
+- `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.8)
 - `--no_compression`: Disable compression in output TIFF files (default: enabled)
+- `--no_half`: Disable fp16 mixed precision inference (default: enabled on tensor-core GPUs only). fp16 is automatically skipped on older GPUs without tensor cores (compute capability < 7.0, e.g. GTX 10-series / Pascal), where fp16 would be slower than fp32.
 
 **Note**: `norm_division_factor` is automatically loaded from the training parameters to ensure consistency with the trained model.
 
