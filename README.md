@@ -91,6 +91,7 @@ python train.py path/to/your/config.json
 - `--norm_division_factor`: Division factor for group normalization (default: 1, i.e. "instance")
 - `--no_half`: Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0). Automatically skipped on older cards (GTX 10-series / Pascal) where fp16 would be slower than fp32.
 - `--keep_only_last`: Keep only the most recent epoch's checkpoint on disk; the previous epoch's `weights_epoch_NNN.torch` is deleted after each save (default: every epoch is preserved, useful for testing/ablation).
+- `--loss`: Loss function used during training. Either `mse` (default) or `l1`. Both are valid for Noise2Noise on symmetric noise distributions: MSE recovers the conditional mean (the standard N2N choice, slightly over-smoothed output), while L1 recovers the conditional median (often visibly sharper edges, comparable flat-region quality). The chosen loss is persisted to `params.json` for traceability.
 
 #### Examples:
 
@@ -119,7 +120,7 @@ python inference.py path/to/your/config.json
 
 **Note**: Inference will automatically use the latest checkpoint available in the checkpoint directory.
 
-**Note**: Inference should take minutes.
+**Note**: Inference runtime depends strongly on the `--overlap` setting and the test volume size. At the default overlap of 0.8 on a large volume (e.g. ~400×500×1000 voxels), expect a few hours on a consumer GPU; on smaller volumes or with `--tta` disabled and larger `--batch_size`, runtime drops accordingly. fp16 mixed precision (enabled by default on tensor-core GPUs) further reduces it.
 
 #### Optional Arguments:
 

@@ -1,7 +1,6 @@
 import json
 import itertools
 import torch
-import gc
 import psutil
 import numpy as np
 import tifffile
@@ -419,10 +418,6 @@ def train_model(dl, model, loss_func, optimizer,
             prev_ckpt = checkpoint_dir / f"weights_epoch_{epoch - 1:03d}.torch"
             if prev_ckpt.exists():
                 prev_ckpt.unlink()
-        
-        # Clear memory to prevent CUDA out of memory errors
-        del epoch_loss
-        gc.collect()
 
     loss_csv.close()
 
@@ -489,8 +484,13 @@ def main(params):
         worker_init_fn=_worker_init_fn if params.num_workers > 0 else None,
     )
 
-    # Create loss function and optimizer
-    loss_func = torch.nn.MSELoss()
+    # Create loss function and optimizer. MSE is the N2N default and recovers
+    # the conditional mean of the clean signal. L1 also satisfies the N2N
+    # convergence requirement for symmetric noise (recovers the conditional
+    # median, which equals the mean for symmetric distributions) and tends to
+    # produce visibly sharper edges by penalizing large residuals less harshly.
+    loss_classes = {"mse": torch.nn.MSELoss, "l1": torch.nn.L1Loss}
+    loss_func = loss_classes[params.loss]()
     optimizer = torch.optim.Adam(model.parameters(), weight_decay=WEIGHT_DECAY, lr=LEARNING_RATE)
 
     # Save the training parameters including normalization statistics
@@ -555,5 +555,6 @@ if __name__ == "__main__":
     parse.add_argument('--num_workers', default=4, type=int, help="Number of DataLoader worker processes (default: 4; use 0 on very low-RAM systems)")
     parse.add_argument('--no_half', action='store_true', help="Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0)")
     parse.add_argument('--keep_only_last', action='store_true', help="Keep only the most recent epoch's checkpoint on disk; delete previous ones after each save (default: keep every epoch)")
+    parse.add_argument('--loss', default='mse', choices=('mse', 'l1'), help="Loss function: 'mse' (default, recovers conditional mean) or 'l1' (recovers conditional median for symmetric noise; often produces sharper edges)")
 
     main(parse.parse_args())
