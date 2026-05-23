@@ -118,37 +118,41 @@ class CubeSymmetryTransform(tio.Transform):
 
 
 def _parse_crop(crop, volume_shape):
-    """Validate and normalize the optional 'crop' entry from the JSON config.
+    """Validate and normalize the optional 'training_crop' entry from the JSON config.
 
     Accepts a dict of the form {"x": [start, end], "y": [start, end], "z":
     [start, end]} with half-open intervals in voxel coordinates (start
-    inclusive, end exclusive). Returns either None (no crop requested) or a
-    tuple of three (start, end) pairs in axis-0, axis-1, axis-2 order.
+    inclusive, end exclusive). Follows the standard 3D imaging convention:
+    z -> axis 0 (slice/depth), y -> axis 1 (row), x -> axis 2 (column).
+    Returns either None (no crop requested) or a tuple of three (start, end)
+    pairs in axis-0, axis-1, axis-2 order.
     """
     if crop is None:
         return None
     if not isinstance(crop, dict) or set(crop.keys()) != {"x", "y", "z"}:
         raise ValueError(
-            f"'crop' must be a dict with exactly the keys 'x', 'y', 'z' (got {crop})"
+            f"'training_crop' must be a dict with exactly the keys 'x', 'y', 'z' (got {crop})"
         )
-    ranges = []
-    for axis, axis_name in enumerate(("x", "y", "z")):
+    # JSON key -> axis index (standard imaging convention)
+    axis_for_key = {"z": 0, "y": 1, "x": 2}
+    ranges = [None, None, None]
+    for axis_name, axis in axis_for_key.items():
         rng = crop[axis_name]
         if not (isinstance(rng, (list, tuple)) and len(rng) == 2):
             raise ValueError(
-                f"crop[{axis_name!r}] must be a 2-element [start, end] list (got {rng})"
+                f"training_crop[{axis_name!r}] must be a 2-element [start, end] list (got {rng})"
             )
         start, end = int(rng[0]), int(rng[1])
         if start < 0 or end <= start:
             raise ValueError(
-                f"crop[{axis_name!r}] must satisfy 0 <= start < end (got [{start}, {end}])"
+                f"training_crop[{axis_name!r}] must satisfy 0 <= start < end (got [{start}, {end}])"
             )
         if end > volume_shape[axis]:
             raise ValueError(
-                f"crop[{axis_name!r}] end={end} exceeds volume size "
+                f"training_crop[{axis_name!r}] end={end} exceeds volume size "
                 f"{volume_shape[axis]} on axis {axis}"
             )
-        ranges.append((start, end))
+        ranges[axis] = (start, end)
     return tuple(ranges)
 
 
@@ -178,18 +182,20 @@ class N2IDataset(Dataset):
                 f"{self.split1_volume.shape} vs {self.split2_volume.shape}"
             )
 
-        # Optional ROI cropping. When the JSON config defines a "crop" entry,
-        # both training volumes are sliced to that bounding box and everything
-        # downstream (normalization stats, patch sampling, diagnostics) sees
-        # only the cropped region. Inference is unaffected — it still runs on
-        # whatever test volume the config points to.
-        self.crop = _parse_crop(dataset_info.get("crop"), self.split1_volume.shape)
+        # Optional ROI cropping. When the JSON config defines a "training_crop"
+        # entry, both training volumes are sliced to that bounding box and
+        # everything downstream (normalization stats, patch sampling, diagnostics)
+        # sees only the cropped region. Inference is unaffected — it still runs
+        # on whatever test volume the config points to.
+        self.crop = _parse_crop(dataset_info.get("training_crop"), self.split1_volume.shape)
         if self.crop is not None:
-            (x0, x1), (y0, y1), (z0, z1) = self.crop
-            self.split1_volume = self.split1_volume[x0:x1, y0:y1, z0:z1].copy()
-            self.split2_volume = self.split2_volume[x0:x1, y0:y1, z0:z1].copy()
+            # Crop tuple is in axis order (axis-0, axis-1, axis-2); under the
+            # standard imaging convention these are (z, y, x).
+            (z0, z1), (y0, y1), (x0, x1) = self.crop
+            self.split1_volume = self.split1_volume[z0:z1, y0:y1, x0:x1].copy()
+            self.split2_volume = self.split2_volume[z0:z1, y0:y1, x0:x1].copy()
             print(
-                f"Applied training crop: x=[{x0},{x1}), y=[{y0},{y1}), z=[{z0},{z1}) "
+                f"Applied training crop: z=[{z0},{z1}), y=[{y0},{y1}), x=[{x0},{x1}) "
                 f"-> shape {self.split1_volume.shape}"
             )
 
@@ -252,27 +258,33 @@ class N2IDataset(Dataset):
         self.transform = CubeSymmetryTransform()
 
     def _load_patch(self, volume, start_coords):
-        """Extract a patch from preloaded volume."""
-        x, y, z = start_coords
-        patch = volume[x:x+self.patch_size[0], y:y+self.patch_size[1], z:z+self.patch_size[2]].clone()
+        """Extract a patch from preloaded volume.
+
+        start_coords is in axis order (axis-0, axis-1, axis-2), which under the
+        standard imaging convention corresponds to (z, y, x).
+        """
+        z, y, x = start_coords
+        patch = volume[z:z+self.patch_size[0], y:y+self.patch_size[1], x:x+self.patch_size[2]].clone()
         return patch.unsqueeze(0)  # Add channel dimension
-    
+
     def __len__(self):
         return self.nb_patches
-    
+
     def __getitem__(self, idx):
-        # Generate random patch coordinates within valid sampling region
-        max_x = self.sampling_shape[0] - self.patch_size[0]
+        # Generate random patch coordinates within valid sampling region.
+        # Naming follows standard imaging convention: z = axis 0 (slice),
+        # y = axis 1 (row), x = axis 2 (column).
+        max_z = self.sampling_shape[0] - self.patch_size[0]
         max_y = self.sampling_shape[1] - self.patch_size[1]
-        max_z = self.sampling_shape[2] - self.patch_size[2]
-        
-        start_x = np.random.randint(0, max_x + 1) + self.sampling_offset[0]
+        max_x = self.sampling_shape[2] - self.patch_size[2]
+
+        start_z = np.random.randint(0, max_z + 1) + self.sampling_offset[0]
         start_y = np.random.randint(0, max_y + 1) + self.sampling_offset[1]
-        start_z = np.random.randint(0, max_z + 1) + self.sampling_offset[2]
-        
+        start_x = np.random.randint(0, max_x + 1) + self.sampling_offset[2]
+
         # Load patches from preloaded volumes (returns float32 torch tensors)
-        patch1 = self._load_patch(self.split1_volume, (start_x, start_y, start_z))
-        patch2 = self._load_patch(self.split2_volume, (start_x, start_y, start_z))
+        patch1 = self._load_patch(self.split1_volume, (start_z, start_y, start_x))
+        patch2 = self._load_patch(self.split2_volume, (start_z, start_y, start_x))
 
         # Apply normalization if needed
         if self.normalization:

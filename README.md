@@ -48,12 +48,14 @@ Prepare your three multi-layer TIFF files and choose an empty folder to store ch
 
 **Note**: It is not required that the volumes are perfect cubes of N×N×N voxels.
 
-**Optional ROI crop**: an additional `crop` entry can restrict training to a
-bounding box within `split1`/`split2`. Useful when the volume contains a
-region you do not want to spend network capacity on (e.g. skull around a
-brain, air around a sample). Coordinates are half-open `[start, end)` voxel
-ranges; axes are `x` → axis 0, `y` → axis 1, `z` → axis 2. Inference is
-unaffected — the test volume is processed as-is.
+**Optional ROI crop**: an additional `training_crop` entry can restrict
+training to a bounding box within `split1`/`split2`. Useful when the volume
+contains a region you do not want to spend network capacity on (e.g. skull
+around a brain, air around a sample). Coordinates are half-open
+`[start, end)` voxel ranges and follow the standard 3D imaging convention
+for a multi-layer TIFF loaded as a `(n_slices, height, width)` array:
+`z` → axis 0 (slice / depth), `y` → axis 1 (row), `x` → axis 2 (column).
+Inference is unaffected — the test volume is processed as-is.
 
 ```json
 {
@@ -62,10 +64,10 @@ unaffected — the test volume is processed as-is.
     "checkpoint_path": "path/to/checkpoints/",
     "test_volume_file": "path/to/your/volume_full.tif",
     "output_file": "path/to/output/denoised.tif",
-    "crop": {
-        "x": [100, 500],
+    "training_crop": {
+        "z": [200, 800],
         "y": [50, 450],
-        "z": [200, 800]
+        "x": [100, 500]
     }
 }
 ```
