@@ -130,6 +130,8 @@ python inference.py path/to/your/config.json
 - `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.8)
 - `--no_compression`: Disable compression in output TIFF files (default: enabled)
 - `--no_half`: Disable fp16 mixed precision inference (default: enabled on tensor-core GPUs only). fp16 is automatically skipped on older GPUs without tensor cores (compute capability < 7.0, e.g. GTX 10-series / Pascal), where fp16 would be slower than fp32.
+- `--no_compile`: Disable `torch.compile` (default: enabled when PyTorch 2.0+ is available). When enabled, the model is graph-compiled before inference for ~1.2-1.5x speedup; the first inference call is slower (typically 30-90s) while compilation runs. Automatically falls back to eager mode if PyTorch is older than 2.0 or compilation raises.
+- `--gpu_aggregation`: Keep the sliding-window aggregation buffer on GPU instead of CPU (default: CPU). Faster inference (~1.2-1.5x by eliminating the per-patch GPU→CPU sync) but uses roughly `2 * D * H * W * 4` bytes of additional VRAM (e.g. ~1.6 GB for a 400×500×1000 voxel volume). Recommended only on cards with ample free VRAM after the model and input volume are loaded.
 
 **Note**: `norm_division_factor` is automatically loaded from the training parameters to ensure consistency with the trained model.
 

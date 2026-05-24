@@ -426,7 +426,8 @@ def load_normalization_stats(checkpoint_path: str) -> Optional[Tuple[float, floa
 
 def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
                    batch_size: int, train_patch_size: Tuple[int, int, int],
-                   use_tta: bool, overlap: float, half: bool) -> np.ndarray:
+                   use_tta: bool, overlap: float, half: bool,
+                   gpu_aggregation: bool) -> np.ndarray:
     """
     Run inference on a preloaded volume using a trained denoising model.
     
@@ -510,6 +511,13 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
                 logging.info("    Test-Time Augmentation not applied...")
                 predictor = _forward
             
+            # The sliding-window aggregation buffer can live on CPU (default,
+            # safest for low-VRAM setups) or on GPU (faster — eliminates the
+            # per-patch GPU->CPU sync — but adds ~2 * D * H * W * 4 bytes of
+            # VRAM for the running sum and weight map).
+            agg_device = next(model.parameters()).device if gpu_aggregation else torch.device("cpu")
+            logging.info(f"    Aggregation buffer device: {agg_device}")
+
             # Common sliding window inference
             pred_volume = sliding_window_inference(
                 inputs=test_volume,
@@ -519,8 +527,8 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
                 overlap=overlap,
                 mode="gaussian",
                 padding_mode="replicate",
-                sw_device=next(model.parameters()).device, 
-                device=torch.device("cpu"),
+                sw_device=next(model.parameters()).device,
+                device=agg_device,
                 progress=True,
             )
             
@@ -584,6 +592,8 @@ def main(args) -> None:
         logging.info(f"    CUDA device: {args.cuda_device}")
         logging.info(f"    Test-Time Augmentation: {args.use_tta}")
         logging.info(f"    Mixed precision (fp16): {args.half}")
+        logging.info(f"    torch.compile: {args.compile}")
+        logging.info(f"    GPU aggregation: {args.gpu_aggregation}")
         logging.info(f"    Overlap ratio: {args.overlap}")
         logging.info(f"    Compression: {args.compression}")
         
@@ -620,7 +630,22 @@ def main(args) -> None:
         
         # Load the trained weights from checkpoint
         model = load_checkpoint(model, checkpoint_path)
-   
+
+        # Optionally compile the model with torch.compile for faster inference.
+        # Defensive: requires PyTorch 2.0+ (hasattr check) and falls back to
+        # eager mode if compilation raises so a broken backend doesn't waste
+        # the whole inference run.
+        if not args.no_compile and hasattr(torch, "compile"):
+            try:
+                logging.info("    Compiling model with torch.compile (first inference call will be slower)...")
+                model = torch.compile(model)
+            except Exception as e:
+                logging.warning(f"    torch.compile failed; using eager mode: {e}")
+        elif args.no_compile:
+            logging.info("    torch.compile disabled by --no_compile")
+        else:
+            logging.info("    torch.compile not available (PyTorch < 2.0); using eager mode")
+
         # Load and preprocess the volume (with normalization stats if available)
         logging.info("Loading and preprocessing volume...")
         test_volume, norm_mean, norm_std = _load_and_preprocess_volume(test_volume_path, norm_stats)
@@ -629,7 +654,8 @@ def main(args) -> None:
         logging.info("Running inference...")
         pred_volume = _run_inference(model, test_volume, args.batch_size,
                                    tuple(network_params['train_patch_size']),
-                                   args.use_tta, args.overlap, args.half)
+                                   args.use_tta, args.overlap, args.half,
+                                   args.gpu_aggregation)
 
         # GPU RAM memory monitoring:
         if torch.cuda.is_available():
@@ -685,6 +711,8 @@ if __name__ == "__main__":
     parse.add_argument('--overlap', default=0.8, type=float, help='Overlap ratio between patches for sliding window inference')
     parse.add_argument('--no_compression', action='store_true', help='Disable compression in output TIFF files (default: enabled)')
     parse.add_argument('--no_half', action='store_true', help='Disable fp16 mixed precision inference (default: enabled when CUDA is available)')
+    parse.add_argument('--no_compile', action='store_true', help='Disable torch.compile (default: enabled when PyTorch 2.0+ is available; gives ~1.2-1.5x speedup after one-time compilation overhead)')
+    parse.add_argument('--gpu_aggregation', action='store_true', help='Keep the sliding-window aggregation buffer on GPU instead of CPU (default: CPU). Faster (eliminates per-patch sync) but costs ~2 * D * H * W * 4 bytes of extra VRAM; safe only on cards with enough headroom for the volume size.')
     
     args = parse.parse_args()
     
@@ -692,6 +720,7 @@ if __name__ == "__main__":
     args.use_tta = args.tta
     args.compression = not args.no_compression
     args.half = not args.no_half
+    args.compile = not args.no_compile
     
     main(args)
 
