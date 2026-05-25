@@ -763,7 +763,7 @@ if __name__ == "__main__":
     parse.add_argument('--batch_size', default=4, type=int, help='The number of patches per batch')
     parse.add_argument('--cuda_device', default='auto', type=_cuda_device_arg, help="CUDA device to use: a non-negative integer or 'auto' (picks the GPU with the most free memory via nvidia-smi). Default: auto.")
     parse.add_argument('--tta', action='store_true', help='Enable Test-Time Augmentation (default: disabled)')
-    parse.add_argument('--overlap', default=0.8, type=float, help='Overlap ratio between patches for sliding window inference')
+    parse.add_argument('--overlap', default=0.85, type=float, help='Overlap ratio between patches for sliding window inference')
     parse.add_argument('--no_compression', action='store_true', help='Disable compression in output TIFF files (default: enabled)')
     parse.add_argument('--no_half', action='store_true', help='Disable fp16 mixed precision inference (default: enabled when CUDA is available)')
     parse.add_argument('--no_compile', action='store_true', help='Disable torch.compile (default: enabled when PyTorch 2.0+ is available; gives ~1.2-1.5x speedup after one-time compilation overhead)')

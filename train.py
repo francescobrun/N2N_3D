@@ -605,7 +605,7 @@ if __name__ == "__main__":
     parse.add_argument('input_json', help='Path to JSON file containing dataset information and processing paths')
     parse.add_argument('--loaded_checkpoint_path', default=None, help="If set, load the checkpoint located at the provided path")
     parse.add_argument('--nb_train_epoch', default=50, type=int, help="The number of training epochs")
-    parse.add_argument('--batch_size', default=32, type=int, help="The number of patch per batch")
+    parse.add_argument('--batch_size', default=16, type=int, help="The number of patch per batch")
     parse.add_argument('--cuda_device', default='auto', type=_cuda_device_arg, help="CUDA device to use: a non-negative integer or 'auto' (picks the GPU with the most free memory via nvidia-smi). Default: auto.")
     parse.add_argument('--norm_division_factor', default=1, type=int, help="Division factor for group normalization (1=instance norm, 56=layer norm)")
     parse.add_argument('--num_workers', default=4, type=int, help="Number of DataLoader worker processes (default: 4; use 0 on very low-RAM systems)")

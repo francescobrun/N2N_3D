@@ -86,7 +86,7 @@ python train.py path/to/your/config.json
 
 - `--loaded_checkpoint_path`: Path to a checkpoint file to resume training from (default: None)
 - `--nb_train_epoch`: Number of training epochs (default: 50)
-- `--batch_size`: Number of patches per batch (default: 32)
+- `--batch_size`: Number of patches per batch (default: 16)
 - `--cuda_device`: CUDA device to use. A non-negative integer selects that specific GPU; the string `auto` (default) picks the GPU with the most free memory via `nvidia-smi`. Useful on shared multi-GPU machines to avoid colliding with other users. Falls back to GPU 0 if `nvidia-smi` is unavailable.
 - `--norm_division_factor`: Division factor for group normalization (default: 1, i.e. "instance")
 - `--no_half`: Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0). Automatically skipped on older cards (GTX 10-series / Pascal) where fp16 would be slower than fp32.
@@ -120,14 +120,14 @@ python inference.py path/to/your/config.json
 
 **Note**: Inference will automatically use the latest checkpoint available in the checkpoint directory.
 
-**Note**: Inference runtime depends strongly on the `--overlap` setting and the test volume size. At the default overlap of 0.8 on a large volume (e.g. ~400×500×1000 voxels), expect a few hours on a consumer GPU; on smaller volumes or with `--tta` disabled and larger `--batch_size`, runtime drops accordingly. fp16 mixed precision (enabled by default on tensor-core GPUs) further reduces it.
+**Note**: Inference runtime depends strongly on the `--overlap` setting and the test volume size. At the default overlap of 0.85 on a large volume (e.g. ~400×500×1000 voxels), expect a few hours on a consumer GPU; on smaller volumes or with `--tta` disabled and larger `--batch_size`, runtime drops accordingly. fp16 mixed precision (enabled by default on tensor-core GPUs) further reduces it.
 
 #### Optional Arguments:
 
 - `--batch_size`: Number of patches processed simultaneously (default: 4)
 - `--cuda_device`: CUDA device to use. A non-negative integer selects that specific GPU; the string `auto` (default) picks the GPU with the most free memory via `nvidia-smi`. Useful on shared multi-GPU machines to avoid colliding with other users. Falls back to GPU 0 if `nvidia-smi` is unavailable.
 - `--tta`: Enable Test-Time Augmentation (default: disabled)
-- `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.8)
+- `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.85)
 - `--no_compression`: Disable compression in output TIFF files (default: enabled)
 - `--no_half`: Disable fp16 mixed precision inference (default: enabled on tensor-core GPUs only). fp16 is automatically skipped on older GPUs without tensor cores (compute capability < 7.0, e.g. GTX 10-series / Pascal), where fp16 would be slower than fp32.
 - `--no_compile`: Disable `torch.compile` (default: enabled when PyTorch 2.0+ is available). When enabled, the model is graph-compiled before inference for ~1.2-1.5x speedup; the first inference call is slower (typically 30-90s) while compilation runs. Automatically falls back to eager mode if PyTorch is older than 2.0 or compilation raises.
