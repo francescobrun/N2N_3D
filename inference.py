@@ -83,7 +83,7 @@ def _invert_rotation_5d(tensor: torch.Tensor, axes_perm, sign_flips) -> torch.Te
 def setup_logging() -> None:
     """
     Configure logging settings for the inference script.
-    
+
     This function sets up the logging module to provide informative output
     during the inference process, including timestamps.
     """
@@ -92,6 +92,58 @@ def setup_logging() -> None:
         format='%(asctime)s - %(message)s',  # Include timestamp but remove log level
         datefmt='%Y-%m-%d %H:%M:%S'  # Timestamp format
     )
+
+
+def _cuda_device_arg(s):
+    """argparse type for --cuda_device: accepts 'auto' or a non-negative int."""
+    if s == "auto":
+        return s
+    try:
+        value = int(s)
+    except ValueError:
+        import argparse
+        raise argparse.ArgumentTypeError(
+            f"--cuda_device must be 'auto' or an integer, got {s!r}"
+        )
+    if value < 0:
+        import argparse
+        raise argparse.ArgumentTypeError(
+            f"--cuda_device must be >= 0, got {value}"
+        )
+    return value
+
+
+def _select_cuda_device(arg):
+    """Resolve --cuda_device to a concrete GPU index.
+
+    If `arg` is an int, return it as-is. If `arg` is the string 'auto', query
+    nvidia-smi for free memory per GPU and pick the one with the most free.
+    Falls back to 0 if nvidia-smi is unavailable, its output is unparseable,
+    or no GPUs are reported.
+    """
+    if isinstance(arg, int):
+        return arg
+    if arg != "auto":
+        return int(arg)
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            text=True,
+        )
+        free = [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
+        if not free:
+            logging.warning("--cuda_device auto: nvidia-smi returned no GPUs; falling back to 0")
+            return 0
+        idx = max(range(len(free)), key=lambda i: free[i])
+        logging.info(
+            f"--cuda_device auto: selected GPU {idx} with {free[idx]} MiB free "
+            f"(free per GPU: {free})"
+        )
+        return idx
+    except (subprocess.SubprocessError, FileNotFoundError, ValueError) as e:
+        logging.warning(f"--cuda_device auto: nvidia-smi failed ({e}); falling back to 0")
+        return 0
 
 def _load_and_preprocess_volume(volume_path: str, mean_std_norm: Optional[Tuple[float, float]] = None) -> Tuple[torch.Tensor, float, float]:
     """
@@ -609,7 +661,10 @@ def main(args) -> None:
         
         # Create the model architecture and load trained weights
         logging.info("Creating and loading model...")
-        
+
+        # Resolve --cuda_device ('auto' picks the GPU with the most free memory).
+        args.cuda_device = _select_cuda_device(args.cuda_device)
+
         # Determine CUDA device
         if torch.cuda.is_available():
             cuda_device = args.cuda_device
@@ -706,7 +761,7 @@ if __name__ == "__main__":
     
     # Optional arguments with default values
     parse.add_argument('--batch_size', default=4, type=int, help='The number of patches per batch')
-    parse.add_argument('--cuda_device', default=0, type=int, help="CUDA device to use (default: 0)")
+    parse.add_argument('--cuda_device', default='auto', type=_cuda_device_arg, help="CUDA device to use: a non-negative integer or 'auto' (picks the GPU with the most free memory via nvidia-smi). Default: auto.")
     parse.add_argument('--tta', action='store_true', help='Enable Test-Time Augmentation (default: disabled)')
     parse.add_argument('--overlap', default=0.8, type=float, help='Overlap ratio between patches for sliding window inference')
     parse.add_argument('--no_compression', action='store_true', help='Disable compression in output TIFF files (default: enabled)')

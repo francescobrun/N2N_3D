@@ -87,7 +87,7 @@ python train.py path/to/your/config.json
 - `--loaded_checkpoint_path`: Path to a checkpoint file to resume training from (default: None)
 - `--nb_train_epoch`: Number of training epochs (default: 50)
 - `--batch_size`: Number of patches per batch (default: 32)
-- `--cuda_device`: CUDA device to use (default: 0)
+- `--cuda_device`: CUDA device to use. A non-negative integer selects that specific GPU; the string `auto` (default) picks the GPU with the most free memory via `nvidia-smi`. Useful on shared multi-GPU machines to avoid colliding with other users. Falls back to GPU 0 if `nvidia-smi` is unavailable.
 - `--norm_division_factor`: Division factor for group normalization (default: 1, i.e. "instance")
 - `--no_half`: Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0). Automatically skipped on older cards (GTX 10-series / Pascal) where fp16 would be slower than fp32.
 - `--keep_only_last`: Keep only the most recent epoch's checkpoint on disk; the previous epoch's `weights_epoch_NNN.torch` is deleted after each save (default: every epoch is preserved, useful for testing/ablation).
@@ -125,7 +125,7 @@ python inference.py path/to/your/config.json
 #### Optional Arguments:
 
 - `--batch_size`: Number of patches processed simultaneously (default: 4)
-- `--cuda_device`: CUDA device to use (default: 0)
+- `--cuda_device`: CUDA device to use. A non-negative integer selects that specific GPU; the string `auto` (default) picks the GPU with the most free memory via `nvidia-smi`. Useful on shared multi-GPU machines to avoid colliding with other users. Falls back to GPU 0 if `nvidia-smi` is unavailable.
 - `--tta`: Enable Test-Time Augmentation (default: disabled)
 - `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.8)
 - `--no_compression`: Disable compression in output TIFF files (default: enabled)

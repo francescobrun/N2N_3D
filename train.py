@@ -315,6 +315,58 @@ def _worker_init_fn(worker_id):
     np.random.seed(torch.initial_seed() % 2**32)
 
 
+def _cuda_device_arg(s):
+    """argparse type for --cuda_device: accepts 'auto' or a non-negative int."""
+    if s == "auto":
+        return s
+    try:
+        value = int(s)
+    except ValueError:
+        import argparse
+        raise argparse.ArgumentTypeError(
+            f"--cuda_device must be 'auto' or an integer, got {s!r}"
+        )
+    if value < 0:
+        import argparse
+        raise argparse.ArgumentTypeError(
+            f"--cuda_device must be >= 0, got {value}"
+        )
+    return value
+
+
+def _select_cuda_device(arg):
+    """Resolve --cuda_device to a concrete GPU index.
+
+    If `arg` is an int, return it as-is. If `arg` is the string 'auto', query
+    nvidia-smi for free memory per GPU and pick the one with the most free.
+    Falls back to 0 if nvidia-smi is unavailable, its output is unparseable,
+    or no GPUs are reported.
+    """
+    if isinstance(arg, int):
+        return arg
+    if arg != "auto":
+        return int(arg)
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            text=True,
+        )
+        free = [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
+        if not free:
+            print("Warning: --cuda_device auto: nvidia-smi returned no GPUs; falling back to 0")
+            return 0
+        idx = max(range(len(free)), key=lambda i: free[i])
+        print(
+            f"--cuda_device auto: selected GPU {idx} with {free[idx]} MiB free "
+            f"(free per GPU: {free})"
+        )
+        return idx
+    except (subprocess.SubprocessError, FileNotFoundError, ValueError) as e:
+        print(f"Warning: --cuda_device auto: nvidia-smi failed ({e}); falling back to 0")
+        return 0
+
+
 def save_model(model, optimizer, epoch, save_path):
     """Save model checkpoint with PyTorch's built-in compression."""
     state = {
@@ -435,6 +487,10 @@ def main(params):
     checkpoint_dir = Path(dataset_info["checkpoint_path"])
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
 
+    # Resolve --cuda_device ('auto' picks the GPU with the most free memory).
+    # After this, params.cuda_device is always a concrete int.
+    params.cuda_device = _select_cuda_device(params.cuda_device)
+
     # Determine device
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{params.cuda_device}")
@@ -550,7 +606,7 @@ if __name__ == "__main__":
     parse.add_argument('--loaded_checkpoint_path', default=None, help="If set, load the checkpoint located at the provided path")
     parse.add_argument('--nb_train_epoch', default=50, type=int, help="The number of training epochs")
     parse.add_argument('--batch_size', default=32, type=int, help="The number of patch per batch")
-    parse.add_argument('--cuda_device', default=0, type=int, help="CUDA device to use (default: 0)")
+    parse.add_argument('--cuda_device', default='auto', type=_cuda_device_arg, help="CUDA device to use: a non-negative integer or 'auto' (picks the GPU with the most free memory via nvidia-smi). Default: auto.")
     parse.add_argument('--norm_division_factor', default=1, type=int, help="Division factor for group normalization (1=instance norm, 56=layer norm)")
     parse.add_argument('--num_workers', default=4, type=int, help="Number of DataLoader worker processes (default: 4; use 0 on very low-RAM systems)")
     parse.add_argument('--no_half', action='store_true', help="Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0)")
