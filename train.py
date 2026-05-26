@@ -1,10 +1,12 @@
 import json
 import itertools
+import time
 import torch
 import psutil
 import numpy as np
 import tifffile
 import torchvision
+from datetime import timedelta
 from pathlib import Path
 from tqdm import tqdm
 from argparse import ArgumentParser
@@ -155,6 +157,80 @@ def _parse_crop(crop, volume_shape):
     return tuple(ranges)
 
 
+def _parse_circle_mask(mask, volume_shape, training_patch_size):
+    """Validate and normalize the optional 'training_circle_mask' entry.
+
+    Accepts a dict with a required 'radius' (float) and optional 'center_y'
+    and 'center_x' (floats; default to the geometric center of the y and x
+    axes of the (post-crop) volume). Coordinates are in post-crop voxel
+    space; the mask is a 2D circle in the y-x plane extended through every
+    z slice (a cylinder), matching the geometry of a typical CT
+    reconstruction whose valid region is the inscribed circle of each slice.
+
+    Returns either None (no mask) or a tuple (center_y, center_x, radius)
+    of floats.
+    """
+    if mask is None:
+        return None
+    if not isinstance(mask, dict):
+        raise ValueError(
+            f"'training_circle_mask' must be a dict (got {type(mask).__name__})"
+        )
+    allowed = {"radius", "center_y", "center_x"}
+    extra = set(mask.keys()) - allowed
+    if extra:
+        raise ValueError(
+            f"training_circle_mask has unknown keys: {sorted(extra)} "
+            f"(allowed: {sorted(allowed)})"
+        )
+    if "radius" not in mask:
+        raise ValueError("training_circle_mask must include 'radius'")
+
+    H, W = volume_shape[1], volume_shape[2]
+    raw_radius = mask["radius"]
+    if isinstance(raw_radius, str):
+        if raw_radius != "auto":
+            raise ValueError(
+                f"training_circle_mask['radius'] must be a positive number or "
+                f"the string 'auto' (got {raw_radius!r})"
+            )
+        # 'auto' = inscribed circle of the post-crop slice: half of the
+        # smaller of the y and x extents. Matches the typical CT geometry
+        # where the valid signal lives inside the inscribed circle of each
+        # square reconstructed slice.
+        radius = min(H, W) / 2.0
+    else:
+        radius = float(raw_radius)
+    if radius <= 0:
+        raise ValueError(
+            f"training_circle_mask['radius'] must be > 0 (got {radius})"
+        )
+
+    center_y = float(mask.get("center_y", (H - 1) / 2.0))
+    center_x = float(mask.get("center_x", (W - 1) / 2.0))
+    if not (0 <= center_y < H):
+        raise ValueError(
+            f"training_circle_mask['center_y']={center_y} must be in [0, {H})"
+        )
+    if not (0 <= center_x < W):
+        raise ValueError(
+            f"training_circle_mask['center_x']={center_x} must be in [0, {W})"
+        )
+
+    # Smallest radius that can hold at least one patch: a patch centered on
+    # the circle center has its farthest corner at distance
+    # sqrt((ps_y - 1)^2 + (ps_x - 1)^2) / 2 from the center.
+    ps_y, ps_x = training_patch_size[1], training_patch_size[2]
+    min_radius = ((ps_y - 1) ** 2 + (ps_x - 1) ** 2) ** 0.5 / 2.0
+    if radius < min_radius:
+        raise ValueError(
+            f"training_circle_mask['radius']={radius:.2f} is too small to contain any "
+            f"{ps_y}x{ps_x} training patch (minimum feasible radius: {min_radius:.2f})"
+        )
+
+    return (center_y, center_x, radius)
+
+
 class N2IDataset(Dataset):
     """
     Noise2Inverse dataset that preloads both volumes into memory for fast training.
@@ -181,12 +257,29 @@ class N2IDataset(Dataset):
                 f"{self.split1_volume.shape} vs {self.split2_volume.shape}"
             )
 
+        # Optional 2D circular mask in the y-x plane (extended through every
+        # z slice as a cylinder). The natural shape for CT reconstructions
+        # whose valid signal lives inside the inscribed circle of each slice.
+        # Coordinates are in ORIGINAL (pre-crop) voxel space because the mask
+        # describes the geometry of the scan itself -- independent of how the
+        # user chooses to crop. 'auto' radius likewise uses the original
+        # slice dimensions, not the cropped ones. When training_crop is also
+        # set, the crop is applied first and the circle center is then
+        # translated to the cropped origin (radius unchanged); patch sampling
+        # enforces both constraints simultaneously.
+        original_shape = self.split1_volume.shape
+        self.circle_mask = _parse_circle_mask(
+            dataset_info.get("training_circle_mask"),
+            original_shape,
+            training_patch_size,
+        )
+
         # Optional ROI cropping. When the JSON config defines a "training_crop"
         # entry, both training volumes are sliced to that bounding box and
         # everything downstream (normalization stats, patch sampling, diagnostics)
         # sees only the cropped region. Inference is unaffected — it still runs
         # on whatever test volume the config points to.
-        self.crop = _parse_crop(dataset_info.get("training_crop"), self.split1_volume.shape)
+        self.crop = _parse_crop(dataset_info.get("training_crop"), original_shape)
         if self.crop is not None:
             # Crop tuple is in axis order (axis-0, axis-1, axis-2); under the
             # standard imaging convention these are (z, y, x).
@@ -208,6 +301,30 @@ class N2IDataset(Dataset):
                 f"dimension must be >= {training_patch_size[0]} voxels) or "
                 f"reduce TRAIN_PATCH_SIZE in train.py."
             )
+
+        # The circle is fixed in original (acquisition) coordinates. When a
+        # crop has also been applied, the runtime patch-acceptance test
+        # addresses cropped offsets, so the circle center is translated
+        # internally by the crop offset for that bookkeeping. The physical
+        # geometry of the circle is unchanged. self.circle_mask retains the
+        # original-coord values for params.json traceability; the _circle_*
+        # attributes hold the runtime (cropped-coord) values.
+        if self.circle_mask is not None:
+            cy_orig, cx_orig, r = self.circle_mask
+            if self.crop is not None:
+                _, (y0, _), (x0, _) = self.crop
+                cy_run, cx_run = cy_orig - y0, cx_orig - x0
+            else:
+                cy_run, cx_run = cy_orig, cx_orig
+            print(
+                f"Applied training circle mask: center=({cy_orig:.1f}, {cx_orig:.1f}), "
+                f"radius={r:.1f} (in y-x plane, extended through z)"
+            )
+            self._circle_cy = cy_run
+            self._circle_cx = cx_run
+            self._circle_r2 = r * r
+        else:
+            self._circle_cy = self._circle_cx = self._circle_r2 = None
 
         # Diagnostic: report how heavily the volume is sampled per epoch.
         # Heavy reuse (high ratio) on tiny volumes or vanishing coverage on huge
@@ -231,15 +348,31 @@ class N2IDataset(Dataset):
         self.patch_size = training_patch_size
         self.nb_patches = nb_patches
         self.normalization = normalization
-        
+
         # Pre-compute normalization statistics if needed
         self.mean = None
         self.std = None
-        
+
         if self.normalization:
             print("Computing normalization statistics...")
-            # Compute unified mean and std from both volumes
-            combined_data = np.concatenate([self.split1_volume.flatten(), self.split2_volume.flatten()])
+            if self.circle_mask is not None:
+                # Exclude out-of-circle voxels from the stats so the corners
+                # (zero/artifact in CT) don't skew the mean/std estimate.
+                H, W = self.volume_shape[1], self.volume_shape[2]
+                y_grid, x_grid = np.ogrid[:H, :W]
+                yx_mask = (
+                    (y_grid - self._circle_cy) ** 2
+                    + (x_grid - self._circle_cx) ** 2
+                ) <= self._circle_r2
+                in_circle_1 = self.split1_volume[:, yx_mask]
+                in_circle_2 = self.split2_volume[:, yx_mask]
+                combined_data = np.concatenate(
+                    [in_circle_1.ravel(), in_circle_2.ravel()]
+                )
+            else:
+                combined_data = np.concatenate(
+                    [self.split1_volume.flatten(), self.split2_volume.flatten()]
+                )
             self.mean = np.float32(combined_data.mean())
             self.std = np.float32(combined_data.std())
             del combined_data
@@ -266,20 +399,49 @@ class N2IDataset(Dataset):
         patch = volume[z:z+self.patch_size[0], y:y+self.patch_size[1], x:x+self.patch_size[2]].clone()
         return patch.unsqueeze(0)  # Add channel dimension
 
+    def _patch_inside_circle(self, start_y, start_x):
+        """Return True if all four xy corners of a patch starting at
+        (start_y, start_x) lie inside the configured circle mask."""
+        if self.circle_mask is None:
+            return True
+        cy, cx, r2 = self._circle_cy, self._circle_cx, self._circle_r2
+        ps_y, ps_x = self.patch_size[1], self.patch_size[2]
+        y0, y1 = start_y, start_y + ps_y - 1
+        x0, x1 = start_x, start_x + ps_x - 1
+        return (
+            (y0 - cy) ** 2 + (x0 - cx) ** 2 <= r2
+            and (y0 - cy) ** 2 + (x1 - cx) ** 2 <= r2
+            and (y1 - cy) ** 2 + (x0 - cx) ** 2 <= r2
+            and (y1 - cy) ** 2 + (x1 - cx) ** 2 <= r2
+        )
+
     def __len__(self):
         return self.nb_patches
 
     def __getitem__(self, idx):
         # Generate random patch coordinates within valid sampling region.
         # Naming follows standard imaging convention: z = axis 0 (slice),
-        # y = axis 1 (row), x = axis 2 (column).
+        # y = axis 1 (row), x = axis 2 (column). When a circle mask is
+        # configured, fall back to rejection sampling: pick a candidate,
+        # accept iff the entire patch fits inside the circle.
         max_z = self.sampling_shape[0] - self.patch_size[0]
         max_y = self.sampling_shape[1] - self.patch_size[1]
         max_x = self.sampling_shape[2] - self.patch_size[2]
 
-        start_z = np.random.randint(0, max_z + 1) + self.sampling_offset[0]
-        start_y = np.random.randint(0, max_y + 1) + self.sampling_offset[1]
-        start_x = np.random.randint(0, max_x + 1) + self.sampling_offset[2]
+        MAX_ATTEMPTS = 200
+        for _ in range(MAX_ATTEMPTS):
+            start_z = np.random.randint(0, max_z + 1) + self.sampling_offset[0]
+            start_y = np.random.randint(0, max_y + 1) + self.sampling_offset[1]
+            start_x = np.random.randint(0, max_x + 1) + self.sampling_offset[2]
+            if self._patch_inside_circle(start_y, start_x):
+                break
+        else:
+            raise RuntimeError(
+                f"Could not find a valid patch position inside the circle mask "
+                f"after {MAX_ATTEMPTS} attempts. The circle may be too small "
+                f"relative to the patch size, or the circle center may be too "
+                f"close to the volume edge."
+            )
 
         # Load patches from preloaded volumes (returns float32 torch tensors)
         patch1 = self._load_patch(self.split1_volume, (start_z, start_y, start_x))
@@ -337,15 +499,16 @@ def _cuda_device_arg(s):
 def _select_cuda_device(arg):
     """Resolve --cuda_device to a concrete GPU index.
 
-    If `arg` is an int, return it as-is. If `arg` is the string 'auto', query
-    nvidia-smi for free memory per GPU and pick the one with the most free.
-    Falls back to 0 if nvidia-smi is unavailable, its output is unparseable,
-    or no GPUs are reported.
+    Returns a tuple (index, info_string). For an explicit integer the info
+    string is empty. For successful 'auto' selection the info string
+    summarizes the choice so the caller can fold it into a single line.
+    Warnings (nvidia-smi missing or unparseable) are printed directly here
+    and the index falls back to 0.
     """
     if isinstance(arg, int):
-        return arg
+        return arg, ""
     if arg != "auto":
-        return int(arg)
+        return int(arg), ""
     try:
         import subprocess
         out = subprocess.check_output(
@@ -355,16 +518,12 @@ def _select_cuda_device(arg):
         free = [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
         if not free:
             print("Warning: --cuda_device auto: nvidia-smi returned no GPUs; falling back to 0")
-            return 0
+            return 0, ""
         idx = max(range(len(free)), key=lambda i: free[i])
-        print(
-            f"--cuda_device auto: selected GPU {idx} with {free[idx]} MiB free "
-            f"(free per GPU: {free})"
-        )
-        return idx
+        return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
     except (subprocess.SubprocessError, FileNotFoundError, ValueError) as e:
         print(f"Warning: --cuda_device auto: nvidia-smi failed ({e}); falling back to 0")
-        return 0
+        return 0, ""
 
 
 def save_model(model, optimizer, epoch, save_path):
@@ -408,8 +567,9 @@ def train_model(dl, model, loss_func, optimizer,
         loss_csv.write("epoch,mean_loss\n")
         loss_csv.flush()
 
-    # Training loop
+    # Training loop. Track the final epoch's loss for the end-of-run summary.
     first_epoch_completed = False
+    final_loss = float("nan")
     for epoch in range(start_epoch_nb, nb_train_epoch):
         epoch_loss = 0
 
@@ -443,19 +603,21 @@ def train_model(dl, model, loss_func, optimizer,
         print(f"Mean loss value of the epoch : {epoch_loss:.4f}")
         loss_csv.write(f"{epoch},{epoch_loss:.6f}\n")
         loss_csv.flush()
-        
-        # Show memory monitoring only after first epoch
+        final_loss = epoch_loss
+
+        # Show memory monitoring only after first epoch. We deliberately do
+        # NOT reset the CUDA peak tracker -- letting it accumulate across all
+        # epochs lets the end-of-run summary report the true overall peak.
         if not first_epoch_completed and torch.cuda.is_available():
             max_memory_allocated = torch.cuda.max_memory_allocated() / 1024**3
-            print(f"GPU memory peak: {max_memory_allocated:.2f} GB")          
-            torch.cuda.reset_peak_memory_stats()
-        
+            print(f"GPU memory peak: {max_memory_allocated:.2f} GB")
+
         if not first_epoch_completed:
             process = psutil.Process()
-            peak_ram_gb = process.memory_info().rss / 1024**3
-            print(f"RAM memory peak: {peak_ram_gb:.2f} GB")
-        
-        first_epoch_completed = True    
+            first_epoch_ram_gb = process.memory_info().rss / 1024**3
+            print(f"RAM memory peak: {first_epoch_ram_gb:.2f} GB")
+
+        first_epoch_completed = True
 
         # Save checkpoint at each epoch
         print("Saving checkpoint for epoch n°{}...".format(epoch))
@@ -473,13 +635,31 @@ def train_model(dl, model, loss_func, optimizer,
 
     loss_csv.close()
 
+    # Return end-of-run stats for the caller's summary line. peak_vram_gb
+    # is the true overall peak across all epochs (we removed the per-epoch
+    # reset of the CUDA tracker above); peak_ram_gb is current RSS which
+    # approximates the peak well for this pipeline (volumes are preloaded
+    # at startup, no growing structures during training).
+    peak_vram_gb = 0.0
+    if torch.cuda.is_available():
+        peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
+    peak_ram_gb = psutil.Process().memory_info().rss / 1024**3
+    return {
+        "final_loss": final_loss,
+        "peak_vram_gb": peak_vram_gb,
+        "peak_ram_gb": peak_ram_gb,
+        "epochs_completed": max(0, nb_train_epoch - start_epoch_nb),
+    }
+
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
 
 def main(params):
     """Main training function."""
-   
+    # Capture wall-clock start so the end-of-run summary can report total time.
+    start_time = time.time()
+
     with open(params.input_json, 'r') as f:
         dataset_info = json.load(f)
     
@@ -489,12 +669,15 @@ def main(params):
 
     # Resolve --cuda_device ('auto' picks the GPU with the most free memory).
     # After this, params.cuda_device is always a concrete int.
-    params.cuda_device = _select_cuda_device(params.cuda_device)
+    params.cuda_device, cuda_info = _select_cuda_device(params.cuda_device)
 
     # Determine device
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{params.cuda_device}")
-        print(f"Using GPU device: cuda:{params.cuda_device}")
+        msg = f"Using GPU device: cuda:{params.cuda_device}"
+        if cuda_info:
+            msg += f" ({cuda_info})"
+        print(msg)
     else:
         device = torch.device("cpu")
         print("CUDA not available, using CPU")
@@ -568,6 +751,7 @@ def main(params):
         'training_batch_size': params.batch_size,
         'training_mixed_precision': use_amp,
         'training_crop': train_dataset.crop,
+        'training_circle_mask': train_dataset.circle_mask,
         # UNet model architecture parameters:
         'unet_in_channels': model.in_channels,
         'unet_out_channels': model.out_channels,
@@ -585,7 +769,7 @@ def main(params):
     print(f"Saved training parameters with normalization statistics: mean={train_dataset.mean:.6f}, std={train_dataset.std:.6f}")
 
     # Train model
-    train_model(
+    stats = train_model(
         train_loader,
         model,
         loss_func,
@@ -596,6 +780,19 @@ def main(params):
         device,
         use_amp,
         params.keep_only_last,
+    )
+
+    # End-of-run summary: total wall-clock, epochs completed, last epoch's
+    # mean loss, peak memory across the full run, and where to find the
+    # checkpoints. Collapses what was previously scattered status into one
+    # scannable record.
+    elapsed = str(timedelta(seconds=int(time.time() - start_time)))
+    print(
+        f"Training complete: {stats['epochs_completed']} epoch(s) in {elapsed}, "
+        f"final mean loss {stats['final_loss']:.4f}, "
+        f"peak VRAM {stats['peak_vram_gb']:.2f} GB, "
+        f"peak RAM {stats['peak_ram_gb']:.2f} GB. "
+        f"Checkpoints in {checkpoint_dir}"
     )
 
 

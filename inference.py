@@ -5,7 +5,8 @@ import itertools
 import tifffile
 import logging
 import psutil
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from argparse import ArgumentParser
 from pathlib import Path
 from typing import Optional, Tuple
@@ -116,15 +117,16 @@ def _cuda_device_arg(s):
 def _select_cuda_device(arg):
     """Resolve --cuda_device to a concrete GPU index.
 
-    If `arg` is an int, return it as-is. If `arg` is the string 'auto', query
-    nvidia-smi for free memory per GPU and pick the one with the most free.
-    Falls back to 0 if nvidia-smi is unavailable, its output is unparseable,
-    or no GPUs are reported.
+    Returns a tuple (index, info_string). For an explicit integer (or 'auto'
+    on a non-multi-GPU machine) the info string is empty. For successful
+    'auto' selection the info string summarizes the choice so the caller can
+    fold it into a single log line. Warnings (nvidia-smi missing or unparseable)
+    are logged directly here and the index falls back to 0.
     """
     if isinstance(arg, int):
-        return arg
+        return arg, ""
     if arg != "auto":
-        return int(arg)
+        return int(arg), ""
     try:
         import subprocess
         out = subprocess.check_output(
@@ -134,16 +136,12 @@ def _select_cuda_device(arg):
         free = [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
         if not free:
             logging.warning("--cuda_device auto: nvidia-smi returned no GPUs; falling back to 0")
-            return 0
+            return 0, ""
         idx = max(range(len(free)), key=lambda i: free[i])
-        logging.info(
-            f"--cuda_device auto: selected GPU {idx} with {free[idx]} MiB free "
-            f"(free per GPU: {free})"
-        )
-        return idx
+        return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
     except (subprocess.SubprocessError, FileNotFoundError, ValueError) as e:
         logging.warning(f"--cuda_device auto: nvidia-smi failed ({e}); falling back to 0")
-        return 0
+        return 0, ""
 
 def _load_and_preprocess_volume(volume_path: str, mean_std_norm: Optional[Tuple[float, float]] = None) -> Tuple[torch.Tensor, float, float]:
     """
@@ -396,11 +394,10 @@ def load_training_params(checkpoint_path: str) -> dict:
         raise FileNotFoundError(f"Training parameters file not found: {params_path}")
     
     try:
-        # Load and parse the JSON parameters file
+        # Load and parse the JSON parameters file. Logging of the load is
+        # done by the caller as part of a consolidated params/norm line.
         with open(params_path, 'r') as f:
             params = json.load(f)
-        
-        logging.info(f"Loaded training parameters from {params_path}")
         return params
     except Exception as e:
         raise RuntimeError(f"Failed to load training parameters: {e}")
@@ -453,32 +450,28 @@ def load_normalization_stats(checkpoint_path: str) -> Optional[Tuple[float, floa
     Raises:
         RuntimeError: If the params.json file cannot be loaded or parsed
     """
+    # Logging of the load (or fallback) is done by the caller as part of a
+    # consolidated params/norm line.
     params_path = Path(checkpoint_path).parent / "params.json"
-    
+
     if not params_path.exists():
-        logging.info("No params.json file found, will compute from volume")
         return None
-    
+
     try:
         with open(params_path, 'r') as f:
             params = json.load(f)
-        
+
         # Check if normalization statistics are present
         if 'normalization_mean' in params and 'normalization_std' in params:
-            mean = params['normalization_mean']
-            std = params['normalization_std']
-            logging.info(f"Loaded normalization statistics from {params_path}: mean={mean:.6f}, std={std:.6f}")
-            return (mean, std)
-        else:
-            logging.info("No normalization statistics found in params.json, will compute from volume")
-            return None
+            return (params['normalization_mean'], params['normalization_std'])
+        return None
     except Exception as e:
         raise RuntimeError(f"Failed to load normalization statistics: {e}")
 
 
 def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
                    batch_size: int, train_patch_size: Tuple[int, int, int],
-                   use_tta: bool, overlap: float, half: bool,
+                   use_tta: bool, overlap: float, use_amp: bool,
                    gpu_aggregation: bool) -> np.ndarray:
     """
     Run inference on a preloaded volume using a trained denoising model.
@@ -498,8 +491,6 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
         RuntimeError: If inference fails at any stage (processing or model execution)
     """
     try:
-        device = next(model.parameters()).device
-        
         # Calculate padding (half patch size on each side)
         pad_d, pad_h, pad_w = [s // 2 for s in train_patch_size]
         
@@ -514,24 +505,6 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
                 test_volume,
                 (pad_w, pad_w, pad_h, pad_h, pad_d, pad_d),
                 mode='replicate'
-            )
-
-            # fp16 autocast requires CUDA and a tensor-core-capable GPU
-            # (compute capability >= 7.0: Volta/Turing/Ampere/Ada/Hopper).
-            # On older cards (e.g. Pascal GTX 10-series) fp16 throughput is
-            # much lower than fp32, so autocast would slow inference down.
-            use_amp = False
-            if half and device.type == "cuda":
-                major, minor = torch.cuda.get_device_capability(device)
-                if major >= 7:
-                    use_amp = True
-                else:
-                    logging.info(
-                        f"    fp16 requested but disabled: GPU compute capability "
-                        f"{major}.{minor} lacks tensor cores; fp16 would run slower than fp32"
-                    )
-            logging.info(
-                f"    Mixed precision (fp16): {'enabled' if use_amp else 'disabled'}"
             )
 
             def _forward(x):
@@ -620,7 +593,10 @@ def main(args) -> None:
     """
     # Initialize logging for the entire process
     setup_logging()
-    
+
+    # Capture wall-clock start so the end-of-run summary can report total time.
+    start_time = time.time()
+
     try:
         # Load configuration from JSON file
         with open(args.input_json, 'r') as f:
@@ -634,7 +610,10 @@ def main(args) -> None:
         # Find the latest checkpoint in the directory
         checkpoint_path = find_latest_checkpoint(checkpoint_dir)
         
-        # Log the inference configuration for user reference
+        # Log the inference configuration for user reference. fp16 and
+        # torch.compile are intentionally omitted from this banner because
+        # they are GPU-capability-gated and shown with full context in the
+        # consolidated hardware-detection block below.
         logging.info("Starting inference with configuration:")
         logging.info(f"    Input JSON: {args.input_json}")
         logging.info(f"    Test volume: {test_volume_path}")
@@ -643,93 +622,152 @@ def main(args) -> None:
         logging.info(f"    Batch size: {args.batch_size}")
         logging.info(f"    CUDA device: {args.cuda_device}")
         logging.info(f"    Test-Time Augmentation: {args.use_tta}")
-        logging.info(f"    Mixed precision (fp16): {args.half}")
-        logging.info(f"    torch.compile: {args.compile}")
         logging.info(f"    GPU aggregation: {args.gpu_aggregation}")
         logging.info(f"    Overlap ratio: {args.overlap}")
         logging.info(f"    Compression: {args.compression}")
-        
-        # Load training parameters and normalization stats
+
+        # Phase separator
+        logging.info("")
+
+        # Load training parameters and normalization stats. Both come from the
+        # same params.json file; report them in a single combined line.
         network_params = load_training_params(checkpoint_path)
-        
-        # Try to load saved normalization statistics from training
         norm_stats = load_normalization_stats(checkpoint_path)
+        params_path = Path(checkpoint_path).parent / "params.json"
         if norm_stats is not None:
-            logging.info(f"Using normalization statistics from training")
+            mean, std = norm_stats
+            logging.info(
+                f"Loaded training params from {params_path} "
+                f"(norm: mean={mean:.6f}, std={std:.6f})"
+            )
         else:
-            logging.info(f"No saved normalization found, will compute from volume")
-        
+            logging.info(
+                f"Loaded training params from {params_path} "
+                f"(norm: not saved, will compute from volume)"
+            )
+
+        # Phase separator
+        logging.info("")
+
         # Create the model architecture and load trained weights
         logging.info("Creating and loading model...")
 
         # Resolve --cuda_device ('auto' picks the GPU with the most free memory).
-        args.cuda_device = _select_cuda_device(args.cuda_device)
+        args.cuda_device, cuda_info = _select_cuda_device(args.cuda_device)
 
-        # Determine CUDA device
+        # Determine CUDA device + resolve every GPU-capability-gated decision
+        # (fp16, torch.compile) in one block so adjacent log lines tell the
+        # user exactly what's actually enabled on this hardware.
         if torch.cuda.is_available():
             cuda_device = args.cuda_device
-            logging.info(f"    Using GPU device: cuda:{cuda_device}")
+            msg = f"    Using GPU device: cuda:{cuda_device}"
+            if cuda_info:
+                msg += f" ({cuda_info})"
+            logging.info(msg)
+            compute_major, compute_minor = torch.cuda.get_device_capability(cuda_device)
         else:
             cuda_device = 0
-            logging.info(f"    CUDA not available, using CPU")
-        
+            logging.info("    CUDA not available, using CPU")
+            compute_major, compute_minor = 0, 0
+
+        # fp16 mixed precision: needs CUDA + compute capability >= 7.0
+        # (tensor cores). On Pascal, fp16 throughput is much lower than fp32.
+        if args.half and torch.cuda.is_available() and compute_major >= 7:
+            use_amp = True
+            logging.info(
+                f"    Mixed precision (fp16): enabled "
+                f"(compute capability {compute_major}.{compute_minor})"
+            )
+        else:
+            use_amp = False
+            if not args.half:
+                reason = "--no_half"
+            elif not torch.cuda.is_available():
+                reason = "CPU"
+            else:
+                reason = (
+                    f"compute capability {compute_major}.{compute_minor} lacks "
+                    f"tensor cores; fp16 would run slower than fp32"
+                )
+            logging.info(f"    Mixed precision (fp16): disabled ({reason})")
+
+        # torch.compile: needs PyTorch 2.0+ + CUDA + compute capability >= 7.0.
+        # Triton (the inductor backend) refuses to compile for compute < 7.0.
+        if args.no_compile:
+            use_compile = False
+            logging.info("    torch.compile: disabled (--no_compile)")
+        elif not hasattr(torch, "compile"):
+            use_compile = False
+            logging.info("    torch.compile: disabled (PyTorch < 2.0)")
+        elif not torch.cuda.is_available() or compute_major < 7:
+            use_compile = False
+            logging.info(
+                f"    torch.compile: disabled "
+                f"(compute capability {compute_major}.x lacks Triton backend support; requires >= 7.0)"
+            )
+        else:
+            use_compile = True
+            logging.info("    torch.compile: enabled (will compile on first inference call)")
+
         # Create model (with architecture from training parameters)
         # Use norm_division_factor from training parameters, default to 1 if not found
         norm_division_factor = network_params.get('norm_division_factor', 1)
         logging.info(f"    Using norm_division_factor: {norm_division_factor}")
-        
+
         model = create_model(
             device=cuda_device if torch.cuda.is_available() else 'cpu',
             norm_division_factor=norm_division_factor
         )
-        
+
         # Load the trained weights from checkpoint
         model = load_checkpoint(model, checkpoint_path)
 
-        # Optionally compile the model with torch.compile for faster inference.
-        # Defensive: requires PyTorch 2.0+ (hasattr check) and falls back to
-        # eager mode if compilation raises so a broken backend doesn't waste
-        # the whole inference run.
-        if not args.no_compile and hasattr(torch, "compile"):
+        # Apply the already-resolved torch.compile decision. The wrap itself
+        # can still raise on edge cases unrelated to compute capability;
+        # fall back to eager mode in that case.
+        if use_compile:
             try:
-                logging.info("    Compiling model with torch.compile (first inference call will be slower)...")
                 model = torch.compile(model)
             except Exception as e:
-                logging.warning(f"    torch.compile failed; using eager mode: {e}")
-        elif args.no_compile:
-            logging.info("    torch.compile disabled by --no_compile")
-        else:
-            logging.info("    torch.compile not available (PyTorch < 2.0); using eager mode")
+                logging.warning(f"    torch.compile failed at wrap time; using eager mode: {e}")
+
+        # Phase separator
+        logging.info("")
 
         # Load and preprocess the volume (with normalization stats if available)
         logging.info("Loading and preprocessing volume...")
         test_volume, norm_mean, norm_std = _load_and_preprocess_volume(test_volume_path, norm_stats)
-        
-        # Run inference        
+
+        # Phase separator
+        logging.info("")
+
+        # Run inference
         logging.info("Running inference...")
         pred_volume = _run_inference(model, test_volume, args.batch_size,
                                    tuple(network_params['train_patch_size']),
-                                   args.use_tta, args.overlap, args.half,
+                                   args.use_tta, args.overlap, use_amp,
                                    args.gpu_aggregation)
+        output_shape = pred_volume.shape
 
         # GPU RAM memory monitoring:
+        peak_vram_gb = 0.0
         if torch.cuda.is_available():
-            max_memory_allocated = torch.cuda.max_memory_allocated() / 1024**3
-            logging.info(f"GPU memory peak: {max_memory_allocated:.2f} GB")          
+            peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
+            logging.info(f"GPU memory peak: {peak_vram_gb:.2f} GB")
             torch.cuda.reset_peak_memory_stats()
-        
+
         # RAM memory monitoring:
         process = psutil.Process()
         peak_ram_gb = process.memory_info().rss / 1024**3
         logging.info(f"RAM memory peak: {peak_ram_gb:.2f} GB")
-        
+
         # Denormalize the output volume back to original gray level range
         pred_volume = pred_volume * norm_std + norm_mean
         logging.info(f"Denormalized output volume using mean={norm_mean:.6f}, std={norm_std:.6f}")
 
-        # Success message
-        logging.info("Inference completed successfully")
-        
+        # Phase separator
+        logging.info("")
+
         # Save the denoised volume
         logging.info("Saving output...")
         output_path = Path(output_path)
@@ -738,11 +776,32 @@ def main(args) -> None:
         # Determine if output should be multilayer based on file extension
         multilayer = output_path.suffix.lower() in {'.tif', '.tiff'}
         
-        save_output(pred_volume, output_dir, network_params, 
+        save_output(pred_volume, output_dir, network_params,
                    args.use_tta, args.overlap, args.batch_size, cuda_device,
-                   args.compression, multilayer, output_path.name, 
-                   args.input_json, checkpoint_path)   
+                   args.compression, multilayer, output_path.name,
+                   args.input_json, checkpoint_path)
 
+        # End-of-run summary: total wall-clock, output shape, peak memory,
+        # and the output file size on disk. Collapses what used to be three
+        # or four separate trailing lines into one scannable record.
+        elapsed = str(timedelta(seconds=int(time.time() - start_time)))
+        try:
+            output_size_bytes = output_path.stat().st_size
+            if output_size_bytes >= 1024**3:
+                size_str = f"{output_size_bytes / 1024**3:.2f} GB"
+            else:
+                size_str = f"{output_size_bytes / 1024**2:.1f} MB"
+        except OSError:
+            size_str = "size unknown"
+        shape_str = "×".join(str(s) for s in output_shape)
+
+        # Phase separator
+        logging.info("")
+        logging.info(
+            f"Inference complete: {shape_str} voxels in {elapsed}, "
+            f"peak VRAM {peak_vram_gb:.2f} GB, peak RAM {peak_ram_gb:.2f} GB. "
+            f"Output: {output_path.name} ({size_str})"
+        )
 
     except Exception as e:
         # Log any errors that occur during the process

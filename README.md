@@ -55,7 +55,25 @@ around a brain, air around a sample). Coordinates are half-open
 `[start, end)` voxel ranges and follow the standard 3D imaging convention
 for a multi-layer TIFF loaded as a `(n_slices, height, width)` array:
 `z` → axis 0 (slice / depth), `y` → axis 1 (row), `x` → axis 2 (column).
-Inference is unaffected — the test volume is processed as-is.
+
+**Optional circular mask**: an additional `training_circle_mask` entry can
+further restrict training to a 2D circle in the y-x plane (extended through
+every z slice as a cylinder). The natural shape for CT reconstructions
+whose valid signal lives inside the inscribed circle of each square slice —
+the four corners outside the circle are typically zero or reconstruction
+artifacts and you don't want them in the normalization stats or in any
+training patch. Coordinates are in **original (pre-crop) voxel space**
+because the mask describes the geometry of the scan itself, independent of
+the user's crop choice. `radius` is required and accepts either a positive
+number or the string `"auto"` (use the inscribed circle of the original
+slice, i.e. half of the smaller of the y and x extents of the uncropped
+volume — the typical CT case). `center_y` and `center_x` are optional and
+default to the geometric center of the original y and x axes. When
+`training_crop` is also set, the crop is applied first and the circle
+center is then translated to the cropped origin; patch sampling enforces
+both constraints, so the effective training region is the intersection of
+the crop's bounding box and the scan-valid circle. Inference is
+unaffected — the test volume is processed as-is.
 
 ```json
 {
@@ -68,6 +86,9 @@ Inference is unaffected — the test volume is processed as-is.
         "z": [200, 800],
         "y": [50, 450],
         "x": [100, 500]
+    },
+    "training_circle_mask": {
+        "radius": "auto"
     }
 }
 ```
@@ -130,7 +151,7 @@ python inference.py path/to/your/config.json
 - `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.85)
 - `--no_compression`: Disable compression in output TIFF files (default: enabled)
 - `--no_half`: Disable fp16 mixed precision inference (default: enabled on tensor-core GPUs only). fp16 is automatically skipped on older GPUs without tensor cores (compute capability < 7.0, e.g. GTX 10-series / Pascal), where fp16 would be slower than fp32.
-- `--no_compile`: Disable `torch.compile` (default: enabled when PyTorch 2.0+ is available). When enabled, the model is graph-compiled before inference for ~1.2-1.5x speedup; the first inference call is slower (typically 30-90s) while compilation runs. Automatically falls back to eager mode if PyTorch is older than 2.0 or compilation raises.
+- `--no_compile`: Disable `torch.compile` (default: enabled when PyTorch 2.0+ is available **and** the GPU has compute capability >= 7.0). When enabled, the model is graph-compiled before inference for ~1.2-1.5x speedup; the first inference call is slower (typically 30-90s) while compilation runs. Automatically skipped on Pascal and earlier (GTX 10-series, compute < 7.0) because `torch.compile`'s Triton backend doesn't support those cards. Also falls back to eager mode if PyTorch is older than 2.0 or compilation raises.
 - `--gpu_aggregation`: Keep the sliding-window aggregation buffer on GPU instead of CPU (default: CPU). Faster inference (~1.2-1.5x by eliminating the per-patch GPU→CPU sync) but uses roughly `2 * D * H * W * 4` bytes of additional VRAM (e.g. ~1.6 GB for a 400×500×1000 voxel volume). Recommended only on cards with ample free VRAM after the model and input volume are loaded.
 
 **Note**: `norm_division_factor` is automatically loaded from the training parameters to ensure consistency with the trained model.
