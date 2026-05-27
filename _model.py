@@ -42,7 +42,7 @@ def create_model(device=0, norm_division_factor=1):
         kernel_size=3,
         up_kernel_size=3,
         num_res_units=0,
-        act="PRELU",
+        act="ELU",
         dropout=0.0,
     )
 
