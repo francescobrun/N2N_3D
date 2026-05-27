@@ -1,5 +1,6 @@
 import json
 import itertools
+import logging
 import time
 import torch
 import psutil
@@ -14,6 +15,20 @@ from torch.utils.data import Dataset, DataLoader
 import torchio as tio
 
 from _model import create_model
+
+
+def setup_logging() -> None:
+    """Configure logging settings for the training script.
+
+    Mirrors the format used by inference.py so a back-to-back train/infer
+    session has consistent timestamped output that can be cross-correlated
+    by wall clock.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
 
 
 # ============================================================================
@@ -247,7 +262,7 @@ class N2IDataset(Dataset):
         split2_path = dataset_info["split2_volume_file"]
         
         # Preload both volumes into memory
-        print("Loading training volumes into memory...")
+        logging.info("Loading training volumes into memory...")
         self.split1_volume = tifffile.imread(split1_path).astype(np.float32)
         self.split2_volume = tifffile.imread(split2_path).astype(np.float32)
 
@@ -286,7 +301,7 @@ class N2IDataset(Dataset):
             (z0, z1), (y0, y1), (x0, x1) = self.crop
             self.split1_volume = self.split1_volume[z0:z1, y0:y1, x0:x1].copy()
             self.split2_volume = self.split2_volume[z0:z1, y0:y1, x0:x1].copy()
-            print(
+            logging.info(
                 f"Applied training crop: z=[{z0},{z1}), y=[{y0},{y1}), x=[{x0},{x1}) "
                 f"-> shape {self.split1_volume.shape}"
             )
@@ -316,7 +331,7 @@ class N2IDataset(Dataset):
                 cy_run, cx_run = cy_orig - y0, cx_orig - x0
             else:
                 cy_run, cx_run = cy_orig, cx_orig
-            print(
+            logging.info(
                 f"Applied training circle mask: center=({cy_orig:.1f}, {cx_orig:.1f}), "
                 f"radius={r:.1f} (in y-x plane, extended through z)"
             )
@@ -332,10 +347,10 @@ class N2IDataset(Dataset):
         unique_positions = 1
         for vs, ps in zip(self.volume_shape, training_patch_size):
             unique_positions *= (vs - ps + 1)
-        print(
+        logging.info(
             f"Volume size: {'×'.join(str(s) for s in self.volume_shape)}"
         )
-        print(
+        logging.info(
             f"Unique patch start positions: {unique_positions:.2e} "
             f"(patches/epoch: {nb_patches}, coverage per epoch: "
             f"{nb_patches / unique_positions:.2e})"
@@ -354,7 +369,7 @@ class N2IDataset(Dataset):
         self.std = None
 
         if self.normalization:
-            print("Computing normalization statistics...")
+            logging.info("Computing normalization statistics...")
             if self.circle_mask is not None:
                 # Exclude out-of-circle voxels from the stats so the corners
                 # (zero/artifact in CT) don't skew the mean/std estimate.
@@ -517,12 +532,12 @@ def _select_cuda_device(arg):
         )
         free = [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
         if not free:
-            print("Warning: --cuda_device auto: nvidia-smi returned no GPUs; falling back to 0")
+            logging.warning("--cuda_device auto: nvidia-smi returned no GPUs; falling back to 0")
             return 0, ""
         idx = max(range(len(free)), key=lambda i: free[i])
         return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
     except (subprocess.SubprocessError, FileNotFoundError, ValueError) as e:
-        print(f"Warning: --cuda_device auto: nvidia-smi failed ({e}); falling back to 0")
+        logging.warning(f"--cuda_device auto: nvidia-smi failed ({e}); falling back to 0")
         return 0, ""
 
 
@@ -546,7 +561,7 @@ def train_model(dl, model, loss_func, optimizer,
 
     # Load checkpoint if specified
     if loaded_checkpoint_path is not None:
-        print("Loading weights...")
+        logging.info("Loading weights...")
         state = torch.load(loaded_checkpoint_path, map_location=torch.device(device), weights_only=True)
         model.load_state_dict(state['state_dict'])
         optimizer.load_state_dict(state['optimizer'])
@@ -600,7 +615,7 @@ def train_model(dl, model, loss_func, optimizer,
             scaler.update()
             epoch_loss += loss_val.item() / len(dl)
 
-        print(f"Mean loss value of the epoch : {epoch_loss:.4f}")
+        logging.info(f"Mean loss value of the epoch : {epoch_loss:.4f}")
         loss_csv.write(f"{epoch},{epoch_loss:.6f}\n")
         loss_csv.flush()
         final_loss = epoch_loss
@@ -610,17 +625,17 @@ def train_model(dl, model, loss_func, optimizer,
         # epochs lets the end-of-run summary report the true overall peak.
         if not first_epoch_completed and torch.cuda.is_available():
             max_memory_allocated = torch.cuda.max_memory_allocated() / 1024**3
-            print(f"GPU memory peak: {max_memory_allocated:.2f} GB")
+            logging.info(f"GPU memory peak: {max_memory_allocated:.2f} GB")
 
         if not first_epoch_completed:
             process = psutil.Process()
             first_epoch_ram_gb = process.memory_info().rss / 1024**3
-            print(f"RAM memory peak: {first_epoch_ram_gb:.2f} GB")
+            logging.info(f"RAM memory peak: {first_epoch_ram_gb:.2f} GB")
 
         first_epoch_completed = True
 
         # Save checkpoint at each epoch
-        print("Saving checkpoint for epoch n°{}...".format(epoch))
+        logging.info("Saving checkpoint for epoch n°{}...".format(epoch))
         save_model(model, optimizer, epoch, checkpoint_dir / f"weights_epoch_{epoch:03d}.torch")
 
         # If keep_only_last is set, delete the previous epoch's checkpoint
@@ -657,6 +672,9 @@ def train_model(dl, model, loss_func, optimizer,
 
 def main(params):
     """Main training function."""
+    # Configure timestamped logging (mirrors inference.py).
+    setup_logging()
+
     # Capture wall-clock start so the end-of-run summary can report total time.
     start_time = time.time()
 
@@ -677,10 +695,10 @@ def main(params):
         msg = f"Using GPU device: cuda:{params.cuda_device}"
         if cuda_info:
             msg += f" ({cuda_info})"
-        print(msg)
+        logging.info(msg)
     else:
         device = torch.device("cpu")
-        print("CUDA not available, using CPU")
+        logging.info("CUDA not available, using CPU")
 
     # fp16 mixed-precision training requires CUDA and a tensor-core-capable
     # GPU (compute capability >= 7.0: Volta/Turing/Ampere/Ada/Hopper). On
@@ -691,21 +709,21 @@ def main(params):
         major, minor = torch.cuda.get_device_capability(device)
         if major >= 7:
             use_amp = True
-            print(f"Mixed precision (fp16): enabled (compute capability {major}.{minor})")
+            logging.info(f"Mixed precision (fp16): enabled (compute capability {major}.{minor})")
         else:
-            print(
+            logging.info(
                 f"Mixed precision (fp16): disabled — GPU compute capability "
                 f"{major}.{minor} lacks tensor cores; fp16 would run slower than fp32"
             )
     else:
-        print("Mixed precision (fp16): disabled")
+        logging.info("Mixed precision (fp16): disabled")
     
     # Initialize the model to be trained
     model = create_model(device=params.cuda_device if torch.cuda.is_available() else 'cpu',
                         norm_division_factor=getattr(params, 'norm_division_factor', 1))
 
     # Create the memory-efficient data loading pipeline
-    print("Setting up data loader...")
+    logging.info("Setting up data loader...")
     train_dataset = N2IDataset(
         params.input_json,
         TRAIN_PATCH_SIZE,
@@ -766,7 +784,7 @@ def main(params):
     })
     with open(checkpoint_dir / "params.json", 'w') as par_file:
         json.dump(params_dict, par_file)
-    print(f"Saved training parameters with normalization statistics: mean={train_dataset.mean:.6f}, std={train_dataset.std:.6f}")
+    logging.info(f"Saved training parameters with normalization statistics: mean={train_dataset.mean:.6f}, std={train_dataset.std:.6f}")
 
     # Train model
     stats = train_model(
@@ -787,7 +805,7 @@ def main(params):
     # checkpoints. Collapses what was previously scattered status into one
     # scannable record.
     elapsed = str(timedelta(seconds=int(time.time() - start_time)))
-    print(
+    logging.info(
         f"Training complete: {stats['epochs_completed']} epoch(s) in {elapsed}, "
         f"final mean loss {stats['final_loss']:.4f}, "
         f"peak VRAM {stats['peak_vram_gb']:.2f} GB, "
