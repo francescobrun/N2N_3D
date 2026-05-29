@@ -770,17 +770,23 @@ def main(params):
         'training_mixed_precision': use_amp,
         'training_crop': train_dataset.crop,
         'training_circle_mask': train_dataset.circle_mask,
-        # UNet model architecture parameters:
-        'unet_in_channels': model.in_channels,
-        'unet_out_channels': model.out_channels,
-        'unet_channels': model.channels,
-        'unet_strides': model.strides,
-        'unet_kernel_size': model.kernel_size,
-        'unet_up_kernel_size': model.up_kernel_size,
-        'unet_num_res_units': model.num_res_units,
-        'unet_act': model.act,
-        'unet_norm': model.norm,
-        'unet_dropout': model.dropout
+        # Image-level residual learning: the trained model computes
+        # output = input + unet(input). Recorded in params.json so any
+        # downstream tooling that needs to reason about checkpoint type
+        # can detect it without inspecting state_dict keys.
+        'residual_learning': True,
+        # UNet model architecture parameters (read from the inner unet,
+        # which is wrapped by ResidualUNet on this branch).
+        'unet_in_channels': model.unet.in_channels,
+        'unet_out_channels': model.unet.out_channels,
+        'unet_channels': model.unet.channels,
+        'unet_strides': model.unet.strides,
+        'unet_kernel_size': model.unet.kernel_size,
+        'unet_up_kernel_size': model.unet.up_kernel_size,
+        'unet_num_res_units': model.unet.num_res_units,
+        'unet_act': model.unet.act,
+        'unet_norm': model.unet.norm,
+        'unet_dropout': model.unet.dropout,
     })
     with open(checkpoint_dir / "params.json", 'w') as par_file:
         json.dump(params_dict, par_file)
