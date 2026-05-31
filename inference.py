@@ -1,7 +1,6 @@
 import numpy as np
 import torch
 import json
-import itertools
 import tifffile
 import logging
 import psutil
@@ -23,63 +22,17 @@ warnings.filterwarnings(
 )
 
 
-# ============================================================================
-# TEST-TIME AUGMENTATION HELPERS
-# ============================================================================
-# The 24 proper rotations of the cube, used by TTA to average predictions over
-# all orientations the model was trained to be invariant to. Duplicated from
-# train.py rather than imported to keep inference.py self-contained (the
-# rotation group is a fixed mathematical object that won't change).
+# AMP API compatibility: PyTorch 2.0+ exposes torch.autocast (device-agnostic),
+# while older PyTorch (~1.6 to ~1.13) exposes torch.cuda.amp.autocast. Both are
+# functionally equivalent for our usage; we pick whichever is available so the
+# pipeline runs on older toolchains too.
+if hasattr(torch, "autocast"):
+    def _amp_autocast(enabled):
+        return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=enabled)
+else:
+    def _amp_autocast(enabled):
+        return torch.cuda.amp.autocast(enabled=enabled)
 
-def _cube_rotation_group():
-    """Return the 24 proper rotations of the cube as (axes_perm, sign_flips)."""
-    rotations = []
-    for perm in itertools.permutations((0, 1, 2)):
-        inversions = sum(
-            1 for i in range(3) for j in range(i + 1, 3) if perm[i] > perm[j]
-        )
-        perm_sign = 1 if inversions % 2 == 0 else -1
-        for signs in itertools.product((1, -1), repeat=3):
-            if perm_sign * signs[0] * signs[1] * signs[2] == 1:
-                rotations.append((perm, signs))
-    assert len(rotations) == 24
-    return rotations
-
-
-CUBE_ROTATIONS = _cube_rotation_group()
-
-
-def _rotate_5d(tensor: torch.Tensor, axes_perm, sign_flips) -> torch.Tensor:
-    """Apply a cube rotation to a (B, C, D, H, W) tensor.
-
-    Permutes the three spatial axes by `axes_perm`, then flips each spatial
-    axis where the corresponding `sign_flips` entry is -1. This matches the
-    convention used in train.py's CubeSymmetryTransform._apply_rotation.
-    """
-    perm = (0, 1, axes_perm[0] + 2, axes_perm[1] + 2, axes_perm[2] + 2)
-    tensor = tensor.permute(perm)
-    flip_dims = tuple(i + 2 for i, s in enumerate(sign_flips) if s == -1)
-    if flip_dims:
-        tensor = tensor.flip(flip_dims)
-    return tensor
-
-
-def _invert_rotation_5d(tensor: torch.Tensor, axes_perm, sign_flips) -> torch.Tensor:
-    """Undo a rotation applied by _rotate_5d.
-
-    Forward is permute-then-flip; inverse is flip-then-inverse-permute. Axis
-    flips are self-inverse, so the flip step uses the same axes (still in the
-    post-permute frame).
-    """
-    flip_dims = tuple(i + 2 for i, s in enumerate(sign_flips) if s == -1)
-    if flip_dims:
-        tensor = tensor.flip(flip_dims)
-    inv_perm = [0, 0, 0]
-    for i, p in enumerate(axes_perm):
-        inv_perm[p] = i
-    perm = (0, 1, inv_perm[0] + 2, inv_perm[1] + 2, inv_perm[2] + 2)
-    tensor = tensor.permute(perm)
-    return tensor
 
 def setup_logging() -> None:
     """
@@ -117,16 +70,44 @@ def _cuda_device_arg(s):
 def _select_cuda_device(arg):
     """Resolve --cuda_device to a concrete GPU index.
 
-    Returns a tuple (index, info_string). For an explicit integer (or 'auto'
-    on a non-multi-GPU machine) the info string is empty. For successful
-    'auto' selection the info string summarizes the choice so the caller can
-    fold it into a single log line. Warnings (nvidia-smi missing or unparseable)
-    are logged directly here and the index falls back to 0.
+    Returns a tuple (index, info_string). For an explicit integer the info
+    string is empty. For successful 'auto' selection the info string
+    summarizes the choice so the caller can fold it into a single log line.
+    Warnings are logged directly here and the index falls back to 0.
+
+    Free memory is queried via torch.cuda.mem_get_info when available
+    (PyTorch 1.11+), which respects CUDA_VISIBLE_DEVICES and only reports
+    GPUs PyTorch can actually use. We fall back to nvidia-smi only when
+    that API is missing, and refuse to trust nvidia-smi if its device
+    count disagrees with what PyTorch sees -- because nvidia-smi reports
+    physical GPUs, not the subset visible to PyTorch.
     """
     if isinstance(arg, int):
         return arg, ""
     if arg != "auto":
         return int(arg), ""
+
+    if not torch.cuda.is_available():
+        return 0, ""
+
+    n_visible = torch.cuda.device_count()
+    if n_visible == 0:
+        return 0, ""
+
+    # Preferred path: PyTorch's own per-device free-memory query.
+    try:
+        free = []
+        for i in range(n_visible):
+            free_bytes, _ = torch.cuda.mem_get_info(i)
+            free.append(free_bytes // (1024 ** 2))
+        idx = max(range(len(free)), key=lambda i: free[i])
+        return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
+    except AttributeError:
+        pass  # PyTorch < 1.11: mem_get_info not available, fall through
+
+    # Fallback: nvidia-smi. Only trust it if its device count matches
+    # PyTorch's view; otherwise CUDA_VISIBLE_DEVICES (or similar) is
+    # restricting PyTorch and the indices would be mis-mapped.
     try:
         import subprocess
         out = subprocess.check_output(
@@ -134,8 +115,12 @@ def _select_cuda_device(arg):
             text=True,
         )
         free = [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
-        if not free:
-            logging.warning("--cuda_device auto: nvidia-smi returned no GPUs; falling back to 0")
+        if len(free) != n_visible:
+            logging.warning(
+                f"--cuda_device auto: nvidia-smi reports {len(free)} GPUs but "
+                f"PyTorch sees {n_visible} (likely CUDA_VISIBLE_DEVICES is set); "
+                f"falling back to cuda:0 for safety."
+            )
             return 0, ""
         idx = max(range(len(free)), key=lambda i: free[i])
         return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
@@ -256,8 +241,8 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> torch.nn.Mo
     except Exception as e:
         raise RuntimeError(f"Failed to load checkpoint: {e}")
 
-def save_output(volume: np.ndarray, output_dir: Path, network_params: dict, 
-                use_tta: bool, overlap: float, batch_size: int, cuda_device: int,
+def save_output(volume: np.ndarray, output_dir: Path, network_params: dict,
+                overlap: float, batch_size: int, cuda_device: int,
                 compression: bool = True, multilayer: bool = True, filename: str = "output_multilayer.tif",
                 input_json_path: str = None, checkpoint_file: str = None) -> None:
     """
@@ -315,7 +300,6 @@ def save_output(volume: np.ndarray, output_dir: Path, network_params: dict,
             'checkpoint_file': checkpoint_file,
             'inference_batch_size': batch_size,
             'inference_cuda_device': cuda_device,
-            'use_tta': use_tta,
             'overlap': overlap
         }
         
@@ -471,17 +455,16 @@ def load_normalization_stats(checkpoint_path: str) -> Optional[Tuple[float, floa
 
 def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
                    batch_size: int, train_patch_size: Tuple[int, int, int],
-                   use_tta: bool, overlap: float, use_amp: bool,
+                   overlap: float, use_amp: bool,
                    gpu_aggregation: bool) -> np.ndarray:
     """
     Run inference on a preloaded volume using a trained denoising model.
-    
+
     Args:
         model: Pre-trained PyTorch model loaded with weights
         test_volume: Preprocessed input tensor of shape (1, 1, D, H, W)
         batch_size: Number of patches processed simultaneously in sliding window inference
         train_patch_size: Patch size used during training for sliding window inference
-        use_tta: Whether to use Test-Time Augmentation for improved predictions
         overlap: Overlap ratio between patches for sliding window inference
     
     Returns:
@@ -510,32 +493,10 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
             def _forward(x):
                 # Autocast wraps the forward pass; the output is cast back to
                 # fp32 so the sliding-window aggregation stays numerically clean.
-                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                with _amp_autocast(use_amp):
                     out = model(x)
                 return out.float()
 
-            if use_tta:
-                logging.info(f"    Using Test-Time Augmentation ({len(CUBE_ROTATIONS)} rotations of the cube)...")
-
-                def tta_predictor(x):
-                    # Average predictions over the 24 proper rotations of the
-                    # cube, matching the training augmentation group. For each
-                    # rotation R, predict R(x), then apply R^-1 to bring the
-                    # prediction back into the canonical frame before averaging.
-                    acc = None
-                    with torch.no_grad():
-                        for axes_perm, sign_flips in CUBE_ROTATIONS:
-                            x_aug = _rotate_5d(x, axes_perm, sign_flips)
-                            pred = _forward(x_aug)
-                            pred = _invert_rotation_5d(pred, axes_perm, sign_flips)
-                            acc = pred if acc is None else acc + pred
-                    return acc / len(CUBE_ROTATIONS)
-
-                predictor = tta_predictor
-            else:
-                logging.info("    Test-Time Augmentation not applied...")
-                predictor = _forward
-            
             # The sliding-window aggregation buffer can live on CPU (default,
             # safest for low-VRAM setups) or on GPU (faster — eliminates the
             # per-patch GPU->CPU sync — but adds ~2 * D * H * W * 4 bytes of
@@ -548,7 +509,7 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
                 inputs=test_volume,
                 roi_size=train_patch_size,
                 sw_batch_size=batch_size,
-                predictor=predictor,
+                predictor=_forward,
                 overlap=overlap,
                 mode="gaussian",
                 padding_mode="replicate",
@@ -556,10 +517,7 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
                 device=agg_device,
                 progress=True,
             )
-            
-            if use_tta:
-                logging.info(f"TTA completed with {len(CUBE_ROTATIONS)} rotations of the cube")
-            
+
             # Crop padding from output
             if pad_d > 0 or pad_h > 0 or pad_w > 0:
                 pred_volume = pred_volume[
@@ -621,7 +579,6 @@ def main(args) -> None:
         logging.info(f"    Output: {output_path}")
         logging.info(f"    Batch size: {args.batch_size}")
         logging.info(f"    CUDA device: {args.cuda_device}")
-        logging.info(f"    Test-Time Augmentation: {args.use_tta}")
         logging.info(f"    GPU aggregation: {args.gpu_aggregation}")
         logging.info(f"    Overlap ratio: {args.overlap}")
         logging.info(f"    Compression: {args.compression}")
@@ -745,7 +702,7 @@ def main(args) -> None:
         logging.info("Running inference...")
         pred_volume = _run_inference(model, test_volume, args.batch_size,
                                    tuple(network_params['train_patch_size']),
-                                   args.use_tta, args.overlap, use_amp,
+                                   args.overlap, use_amp,
                                    args.gpu_aggregation)
         output_shape = pred_volume.shape
 
@@ -777,7 +734,7 @@ def main(args) -> None:
         multilayer = output_path.suffix.lower() in {'.tif', '.tiff'}
         
         save_output(pred_volume, output_dir, network_params,
-                   args.use_tta, args.overlap, args.batch_size, cuda_device,
+                   args.overlap, args.batch_size, cuda_device,
                    args.compression, multilayer, output_path.name,
                    args.input_json, checkpoint_path)
 
@@ -821,7 +778,6 @@ if __name__ == "__main__":
     # Optional arguments with default values
     parse.add_argument('--batch_size', default=4, type=int, help='The number of patches per batch')
     parse.add_argument('--cuda_device', default='auto', type=_cuda_device_arg, help="CUDA device to use: a non-negative integer or 'auto' (picks the GPU with the most free memory via nvidia-smi). Default: auto.")
-    parse.add_argument('--tta', action='store_true', help='Enable Test-Time Augmentation (default: disabled)')
     parse.add_argument('--overlap', default=0.85, type=float, help='Overlap ratio between patches for sliding window inference')
     parse.add_argument('--no_compression', action='store_true', help='Disable compression in output TIFF files (default: enabled)')
     parse.add_argument('--no_half', action='store_true', help='Disable fp16 mixed precision inference (default: enabled when CUDA is available)')
@@ -829,9 +785,8 @@ if __name__ == "__main__":
     parse.add_argument('--gpu_aggregation', action='store_true', help='Keep the sliding-window aggregation buffer on GPU instead of CPU (default: CPU). Faster (eliminates per-patch sync) but costs ~2 * D * H * W * 4 bytes of extra VRAM; safe only on cards with enough headroom for the volume size.')
     
     args = parse.parse_args()
-    
+
     # Handle flag logic (default to True, disable if flag is set)
-    args.use_tta = args.tta
     args.compression = not args.no_compression
     args.half = not args.no_half
     args.compile = not args.no_compile

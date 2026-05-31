@@ -17,6 +17,25 @@ import torchio as tio
 from _model import create_model
 
 
+# AMP API compatibility: PyTorch 2.0+ exposes torch.amp.GradScaler / torch.autocast
+# (device-agnostic), while older PyTorch (~1.6 to ~1.13) exposes torch.cuda.amp.*.
+# Both implementations are functionally equivalent for our usage; we pick whichever
+# the installed version provides so the pipeline runs on older toolchains too.
+if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+    def _make_gradscaler(enabled):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+else:
+    def _make_gradscaler(enabled):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+if hasattr(torch, "autocast"):
+    def _amp_autocast(enabled):
+        return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=enabled)
+else:
+    def _amp_autocast(enabled):
+        return torch.cuda.amp.autocast(enabled=enabled)
+
+
 def setup_logging() -> None:
     """Configure logging settings for the training script.
 
@@ -517,13 +536,41 @@ def _select_cuda_device(arg):
     Returns a tuple (index, info_string). For an explicit integer the info
     string is empty. For successful 'auto' selection the info string
     summarizes the choice so the caller can fold it into a single line.
-    Warnings (nvidia-smi missing or unparseable) are printed directly here
-    and the index falls back to 0.
+    Warnings are printed directly here and the index falls back to 0.
+
+    Free memory is queried via torch.cuda.mem_get_info when available
+    (PyTorch 1.11+), which respects CUDA_VISIBLE_DEVICES and only reports
+    GPUs PyTorch can actually use. We fall back to nvidia-smi only when
+    that API is missing, and refuse to trust nvidia-smi if its device
+    count disagrees with what PyTorch sees -- because nvidia-smi reports
+    physical GPUs, not the subset visible to PyTorch.
     """
     if isinstance(arg, int):
         return arg, ""
     if arg != "auto":
         return int(arg), ""
+
+    if not torch.cuda.is_available():
+        return 0, ""
+
+    n_visible = torch.cuda.device_count()
+    if n_visible == 0:
+        return 0, ""
+
+    # Preferred path: PyTorch's own per-device free-memory query.
+    try:
+        free = []
+        for i in range(n_visible):
+            free_bytes, _ = torch.cuda.mem_get_info(i)
+            free.append(free_bytes // (1024 ** 2))
+        idx = max(range(len(free)), key=lambda i: free[i])
+        return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
+    except AttributeError:
+        pass  # PyTorch < 1.11: mem_get_info not available, fall through
+
+    # Fallback: nvidia-smi. Only trust it if its device count matches
+    # PyTorch's view; otherwise CUDA_VISIBLE_DEVICES (or similar) is
+    # restricting PyTorch and the indices would be mis-mapped.
     try:
         import subprocess
         out = subprocess.check_output(
@@ -531,8 +578,12 @@ def _select_cuda_device(arg):
             text=True,
         )
         free = [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
-        if not free:
-            logging.warning("--cuda_device auto: nvidia-smi returned no GPUs; falling back to 0")
+        if len(free) != n_visible:
+            logging.warning(
+                f"--cuda_device auto: nvidia-smi reports {len(free)} GPUs but "
+                f"PyTorch sees {n_visible} (likely CUDA_VISIBLE_DEVICES is set); "
+                f"falling back to cuda:0 for safety."
+            )
             return 0, ""
         idx = max(range(len(free)), key=lambda i: free[i])
         return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
@@ -569,7 +620,7 @@ def train_model(dl, model, loss_func, optimizer,
 
     # GradScaler prevents fp16 gradient underflow during backward. When
     # use_amp=False it's a no-op (passes through scale/step/update calls).
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = _make_gradscaler(use_amp)
 
     # Per-epoch loss log, appended live so the curve survives interruptions
     # and is recoverable for plateau-detection / plotting after training.
@@ -601,7 +652,7 @@ def train_model(dl, model, loss_func, optimizer,
 
             # Forward + loss inside autocast; the ×1000 scaling composes with
             # GradScaler's dynamic scaling — both survive the backward pass.
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            with _amp_autocast(use_amp):
                 pred = model(input)
                 # Use MSE loss. Loss is scaled by 1000 to counteract Adam's eps=1e-8
                 # damping the update when gradients are small (z-score-normalized

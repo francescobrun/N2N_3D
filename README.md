@@ -1,6 +1,6 @@
-# N2N_3D: Noise2Noise (or Noise2Inverse) 3D Volume Denoising
+# N2N_3D: Noise2Noise 3D Volume Denoising
 
-A PyTorch implementation for 3D volumetric image denoising using self-supervised deep learning. This repository provides a complete pipeline for training and inference with a 3D U-Net architecture, specifically designed for denoising  volumetric data without requiring clean target images. Instead, it only needs two replicas of the same noisy volume, as proposed in Noise2Noise or related variations such as e.g. Noise2Inverse. 
+A PyTorch implementation for 3D volumetric image denoising using self-supervised deep learning. This repository provides a complete pipeline for training and inference with a 3D U-Net architecture, specifically designed for denoising  volumetric data without requiring clean target images. Instead, it only needs two replicas of the same noisy volume, as proposed in Noise2Noise or related variations such as e.g. Noise2Inverse, Half2Half, and similar self-supervised paradigms that produce two reconstructions with identical underlying content but independent noise. The pipeline is agnostic to how the split pair is produced — projection-view splitting, detector-side splitting, Poisson photon thinning (Half2Half), repeated independent acquisitions, or any other strategy that satisfies the Noise2Noise assumptions — as long as the two input volumes share the same shape, scale, and underlying scene.
 
 ## 📚 Citation
 
@@ -141,13 +141,12 @@ python inference.py path/to/your/config.json
 
 **Note**: Inference will automatically use the latest checkpoint available in the checkpoint directory.
 
-**Note**: Inference runtime depends strongly on the `--overlap` setting and the test volume size. At the default overlap of 0.85 on a large volume (e.g. ~400×500×1000 voxels), expect a few hours on a consumer GPU; on smaller volumes or with `--tta` disabled and larger `--batch_size`, runtime drops accordingly. fp16 mixed precision (enabled by default on tensor-core GPUs) further reduces it.
+**Note**: Inference runtime depends strongly on the `--overlap` setting and the test volume size. At the default overlap of 0.85 on a large volume (e.g. ~400×500×1000 voxels), expect a few hours on a consumer GPU; on smaller volumes or with a larger `--batch_size`, runtime drops accordingly. fp16 mixed precision (enabled by default on tensor-core GPUs) further reduces it.
 
 #### Optional Arguments:
 
 - `--batch_size`: Number of patches processed simultaneously (default: 4)
 - `--cuda_device`: CUDA device to use. A non-negative integer selects that specific GPU; the string `auto` (default) picks the GPU with the most free memory via `nvidia-smi`. Useful on shared multi-GPU machines to avoid colliding with other users. Falls back to GPU 0 if `nvidia-smi` is unavailable.
-- `--tta`: Enable Test-Time Augmentation (default: disabled)
 - `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.85)
 - `--no_compression`: Disable compression in output TIFF files (default: enabled)
 - `--no_half`: Disable fp16 mixed precision inference (default: enabled on tensor-core GPUs only). fp16 is automatically skipped on older GPUs without tensor cores (compute capability < 7.0, e.g. GTX 10-series / Pascal), where fp16 would be slower than fp32.
@@ -164,9 +163,6 @@ python inference.py config.json
 
 # Inference with larger batch size (uses more memory)
 python inference.py config.json --batch_size 8
-
-# Inference with Test-Time Augmentation (slower but potentially higher quality)
-python inference.py config.json --tta
 
 # Inference with custom overlap (lower overlap = less quality but faster)
 python inference.py config.json --overlap 0.5
