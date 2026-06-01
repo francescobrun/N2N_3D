@@ -34,6 +34,23 @@ else:
         return torch.cuda.amp.autocast(enabled=enabled)
 
 
+# torch.load gained a `weights_only` keyword in PyTorch 1.13 (and the default
+# flipped to True in 2.6 with a FutureWarning otherwise). On older PyTorch the
+# argument doesn't exist and passing it raises TypeError. Detect once and call
+# torch.load with or without the kwarg accordingly.
+import inspect as _inspect
+_TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = (
+    "weights_only" in _inspect.signature(torch.load).parameters
+)
+del _inspect
+
+
+def _safe_torch_load(path, map_location):
+    if _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    return torch.load(path, map_location=map_location)
+
+
 def setup_logging() -> None:
     """
     Configure logging settings for the inference script.
@@ -207,13 +224,13 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> torch.nn.Mo
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
     
     try:
-        # Load weights onto the model's current device; weights_only=True is
+        # Load weights onto the model's current device. weights_only=True is
         # safe here (checkpoints contain only state_dict + optimizer tensors)
-        # and silences the PyTorch 2.6+ FutureWarning.
-        state = torch.load(
+        # and silences the PyTorch 2.6+ FutureWarning; on older PyTorch
+        # (pre-1.13) the keyword doesn't exist, so _safe_torch_load adapts.
+        state = _safe_torch_load(
             checkpoint_path,
             map_location=next(model.parameters()).device,
-            weights_only=True,
         )
         state_dict = state["state_dict"]
         
@@ -456,7 +473,7 @@ def load_normalization_stats(checkpoint_path: str) -> Optional[Tuple[float, floa
 def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
                    batch_size: int, train_patch_size: Tuple[int, int, int],
                    overlap: float, use_amp: bool,
-                   gpu_aggregation: bool) -> np.ndarray:
+                   gpu_aggregation: bool, padding: bool) -> np.ndarray:
     """
     Run inference on a preloaded volume using a trained denoising model.
 
@@ -474,21 +491,31 @@ def _run_inference(model: torch.nn.Module, test_volume: torch.Tensor,
         RuntimeError: If inference fails at any stage (processing or model execution)
     """
     try:
-        # Calculate padding (half patch size on each side)
-        pad_d, pad_h, pad_w = [s // 2 for s in train_patch_size]
-        
+        # Calculate padding (half patch size on each side). When padding is
+        # enabled, every original-volume voxel ends up at or beyond the center
+        # of some patch, where the network's prediction is most reliable.
+        # When disabled (--no_padding), edge voxels are predicted from one-
+        # sided patch context, which can be slightly OOD for the network but
+        # saves ~1.5-2x in inference time on large volumes.
+        if padding:
+            pad_d, pad_h, pad_w = [s // 2 for s in train_patch_size]
+        else:
+            pad_d = pad_h = pad_w = 0
+
         with torch.no_grad():
-            
+
             # Log overlap ratio
             logging.info(f"    Overlap: {overlap:.3f} ({int(overlap*100)}% overlap between patches)")
-            
-            # Pad input volume to avoid edge artifacts
-            logging.info(f"    Padding: {pad_d}×{pad_h}×{pad_w} per side (replicate mode)")
-            test_volume = torch.nn.functional.pad(
-                test_volume,
-                (pad_w, pad_w, pad_h, pad_h, pad_d, pad_d),
-                mode='replicate'
-            )
+
+            if padding:
+                logging.info(f"    Padding: {pad_d}×{pad_h}×{pad_w} per side (replicate mode)")
+                test_volume = torch.nn.functional.pad(
+                    test_volume,
+                    (pad_w, pad_w, pad_h, pad_h, pad_d, pad_d),
+                    mode='replicate'
+                )
+            else:
+                logging.info("    Padding: disabled (--no_padding)")
 
             def _forward(x):
                 # Autocast wraps the forward pass; the output is cast back to
@@ -581,6 +608,7 @@ def main(args) -> None:
         logging.info(f"    CUDA device: {args.cuda_device}")
         logging.info(f"    GPU aggregation: {args.gpu_aggregation}")
         logging.info(f"    Overlap ratio: {args.overlap}")
+        logging.info(f"    Edge padding: {args.padding}")
         logging.info(f"    Compression: {args.compression}")
 
         # Phase separator
@@ -666,8 +694,11 @@ def main(args) -> None:
             use_compile = True
             logging.info("    torch.compile: enabled (will compile on first inference call)")
 
-        # Create model (with architecture from training parameters)
-        # Use norm_division_factor from training parameters, default to 1 if not found
+        # Create model (with architecture from training parameters).
+        # The norm_division_factor is read from the checkpoint's params.json
+        # so inference matches the trained architecture. Falls back to 1
+        # (instance norm) for legacy checkpoints that predate the field;
+        # any checkpoint produced by the current code records it explicitly.
         norm_division_factor = network_params.get('norm_division_factor', 1)
         logging.info(f"    Using norm_division_factor: {norm_division_factor}")
 
@@ -703,7 +734,7 @@ def main(args) -> None:
         pred_volume = _run_inference(model, test_volume, args.batch_size,
                                    tuple(network_params['train_patch_size']),
                                    args.overlap, use_amp,
-                                   args.gpu_aggregation)
+                                   args.gpu_aggregation, args.padding)
         output_shape = pred_volume.shape
 
         # GPU RAM memory monitoring:
@@ -782,6 +813,7 @@ if __name__ == "__main__":
     parse.add_argument('--no_compression', action='store_true', help='Disable compression in output TIFF files (default: enabled)')
     parse.add_argument('--no_half', action='store_true', help='Disable fp16 mixed precision inference (default: enabled when CUDA is available)')
     parse.add_argument('--no_compile', action='store_true', help='Disable torch.compile (default: enabled when PyTorch 2.0+ is available; gives ~1.2-1.5x speedup after one-time compilation overhead)')
+    parse.add_argument('--no_padding', action='store_true', help='Disable replicate-padding of the test volume by half-patch on each side (default: enabled). Padding ensures every output voxel is predicted from well-conditioned patch-center context; disabling it cuts inference time roughly 1.5-2x at the cost of slightly degraded predictions in the outermost ~half-patch of the volume.')
     parse.add_argument('--gpu_aggregation', action='store_true', help='Keep the sliding-window aggregation buffer on GPU instead of CPU (default: CPU). Faster (eliminates per-patch sync) but costs ~2 * D * H * W * 4 bytes of extra VRAM; safe only on cards with enough headroom for the volume size.')
     
     args = parse.parse_args()
@@ -790,6 +822,7 @@ if __name__ == "__main__":
     args.compression = not args.no_compression
     args.half = not args.no_half
     args.compile = not args.no_compile
+    args.padding = not args.no_padding
     
     main(args)
 

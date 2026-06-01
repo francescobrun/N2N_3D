@@ -109,7 +109,7 @@ python train.py path/to/your/config.json
 - `--nb_train_epoch`: Number of training epochs (default: 50)
 - `--batch_size`: Number of patches per batch (default: 16)
 - `--cuda_device`: CUDA device to use. A non-negative integer selects that specific GPU; the string `auto` (default) picks the GPU with the most free memory via `nvidia-smi`. Useful on shared multi-GPU machines to avoid colliding with other users. Falls back to GPU 0 if `nvidia-smi` is unavailable.
-- `--norm_division_factor`: Division factor for group normalization (default: 1, i.e. "instance")
+- `--norm_division_factor`: Division factor for group normalization (default: 56, i.e. layer normalization — num_groups=1). Empirically the best pairing with the residual learning wrapper because it preserves inter-channel structure that helps signal/noise discrimination. Setting it to 1 selects instance normalization (num_groups=56); intermediate divisors of 56 give true group normalization. **Special value 0** disables normalization entirely (`norm=None` in MONAI's UNet) — the network then relies on its skip connections and the residual wrapper for training stability. This is experimental: modern normalization-free networks can work well, but training may converge more slowly or fail to converge cleanly depending on the data, so verify with a short run before committing to it. Valid values: 0, 1, 2, 4, 7, 8, 14, 28, 56.
 - `--no_half`: Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0). Automatically skipped on older cards (GTX 10-series / Pascal) where fp16 would be slower than fp32.
 - `--keep_only_last`: Keep only the most recent epoch's checkpoint on disk; the previous epoch's `weights_epoch_NNN.torch` is deleted after each save (default: every epoch is preserved, useful for testing/ablation).
 - `--loss`: Loss function used during training. Either `mse` (default) or `l1`. Both are valid for Noise2Noise on symmetric noise distributions: MSE recovers the conditional mean (the standard N2N choice, slightly over-smoothed output), while L1 recovers the conditional median (often visibly sharper edges, comparable flat-region quality). The chosen loss is persisted to `params.json` for traceability.
@@ -123,11 +123,14 @@ python train.py config.json
 # Training with custom batch size and more epochs
 python train.py config.json --batch_size 16 --nb_train_epoch 100
 
-# Training with layer normalization
-python train.py config.json --norm_division_factor 56
+# Training with instance normalization (the previous default; 56 groups)
+python train.py config.json --norm_division_factor 1
 
-# Training with custom normalization (28 groups)
-python train.py config.json --norm_division_factor 2
+# Training with intermediate group normalization (e.g. 14 groups)
+python train.py config.json --norm_division_factor 4
+
+# Training with no normalization at all (experimental — verify convergence on a short run first)
+python train.py config.json --norm_division_factor 0
 
 # Resume training from checkpoint
 python train.py config.json --loaded_checkpoint_path checkpoints/weights_epoch_020.torch
@@ -152,6 +155,7 @@ python inference.py path/to/your/config.json
 - `--no_half`: Disable fp16 mixed precision inference (default: enabled on tensor-core GPUs only). fp16 is automatically skipped on older GPUs without tensor cores (compute capability < 7.0, e.g. GTX 10-series / Pascal), where fp16 would be slower than fp32.
 - `--no_compile`: Disable `torch.compile` (default: enabled when PyTorch 2.0+ is available **and** the GPU has compute capability >= 7.0). When enabled, the model is graph-compiled before inference for ~1.2-1.5x speedup; the first inference call is slower (typically 30-90s) while compilation runs. Automatically skipped on Pascal and earlier (GTX 10-series, compute < 7.0) because `torch.compile`'s Triton backend doesn't support those cards. Also falls back to eager mode if PyTorch is older than 2.0 or compilation raises.
 - `--gpu_aggregation`: Keep the sliding-window aggregation buffer on GPU instead of CPU (default: CPU). Faster inference (~1.2-1.5x by eliminating the per-patch GPU→CPU sync) but uses roughly `2 * D * H * W * 4` bytes of additional VRAM (e.g. ~1.6 GB for a 400×500×1000 voxel volume). Recommended only on cards with ample free VRAM after the model and input volume are loaded.
+- `--no_padding`: Disable replicate-padding of the test volume by half the training patch size on each side (default: enabled). Padding ensures every output voxel is predicted from well-conditioned patch-center context; disabling it cuts inference time roughly 1.5-2x at the cost of slightly degraded predictions in the outermost ~half-patch of the volume. With image-level residual learning the cost of disabling is small (the identity pathway preserves input values where the network is uncertain), so this is a reasonable speedup if you don't rely on the outer boundary voxels of the output.
 
 **Note**: `norm_division_factor` is automatically loaded from the training parameters to ensure consistency with the trained model.
 

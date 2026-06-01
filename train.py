@@ -36,6 +36,23 @@ else:
         return torch.cuda.amp.autocast(enabled=enabled)
 
 
+# torch.load gained a `weights_only` keyword in PyTorch 1.13 (and the default
+# flipped to True in 2.6 with a FutureWarning otherwise). On older PyTorch the
+# argument doesn't exist and passing it raises TypeError. Detect once and call
+# torch.load with or without the kwarg accordingly.
+import inspect as _inspect
+_TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = (
+    "weights_only" in _inspect.signature(torch.load).parameters
+)
+del _inspect
+
+
+def _safe_torch_load(path, map_location):
+    if _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    return torch.load(path, map_location=map_location)
+
+
 def setup_logging() -> None:
     """Configure logging settings for the training script.
 
@@ -613,7 +630,7 @@ def train_model(dl, model, loss_func, optimizer,
     # Load checkpoint if specified
     if loaded_checkpoint_path is not None:
         logging.info("Loading weights...")
-        state = torch.load(loaded_checkpoint_path, map_location=torch.device(device), weights_only=True)
+        state = _safe_torch_load(loaded_checkpoint_path, map_location=torch.device(device))
         model.load_state_dict(state['state_dict'])
         optimizer.load_state_dict(state['optimizer'])
         start_epoch_nb = state['epoch']+1
@@ -879,7 +896,7 @@ if __name__ == "__main__":
     parse.add_argument('--nb_train_epoch', default=50, type=int, help="The number of training epochs")
     parse.add_argument('--batch_size', default=16, type=int, help="The number of patch per batch")
     parse.add_argument('--cuda_device', default='auto', type=_cuda_device_arg, help="CUDA device to use: a non-negative integer or 'auto' (picks the GPU with the most free memory via nvidia-smi). Default: auto.")
-    parse.add_argument('--norm_division_factor', default=1, type=int, help="Division factor for group normalization (1=instance norm, 56=layer norm)")
+    parse.add_argument('--norm_division_factor', default=56, type=int, help="Division factor for group normalization. 56 (default) = layer norm (num_groups=1), the best pairing with residual learning; 1 = instance norm (num_groups=56); intermediate divisors of 56 give true group norm. Special value 0 disables normalization entirely (experimental; relies on the U-Net's skip connections and the residual wrapper for stability). Valid values: 0, 1, 2, 4, 7, 8, 14, 28, 56.")
     parse.add_argument('--num_workers', default=4, type=int, help="Number of DataLoader worker processes (default: 4; use 0 on very low-RAM systems)")
     parse.add_argument('--no_half', action='store_true', help="Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0)")
     parse.add_argument('--keep_only_last', action='store_true', help="Keep only the most recent epoch's checkpoint on disk; delete previous ones after each save (default: keep every epoch)")
