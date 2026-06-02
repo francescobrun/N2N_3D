@@ -2,11 +2,9 @@
 # Note: Install torch with CUDA support for GPU acceleration
 # Visit https://pytorch.org/get-started/locally/ for CUDA-specific installation commands
 torch
-torchvision
 
 # Medical image processing and deep learning
 monai
-torchio
 
 # Image processing and data handling
 tifffile

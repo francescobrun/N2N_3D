@@ -6,15 +6,23 @@ import torch
 import psutil
 import numpy as np
 import tifffile
-import torchvision
 from datetime import timedelta
 from pathlib import Path
 from tqdm import tqdm
 from argparse import ArgumentParser
 from torch.utils.data import Dataset, DataLoader
-import torchio as tio
 
 from _model import create_model
+
+
+# Enable cuDNN autotuning and TF32. Training and inference both run fixed-shape
+# convolutions (96^3 patches / fixed sliding-window roi), so cuDNN's benchmark
+# mode pays its one-time autotune cost back immediately by selecting the fastest
+# conv algorithm. TF32 (Ampere+; a no-op on older cards) speeds up the fp32
+# fallback paths with precision that is irrelevant for denoising.
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 
 # AMP API compatibility: PyTorch 2.0+ exposes torch.amp.GradScaler / torch.autocast
@@ -106,67 +114,53 @@ def _cube_rotation_group():
 
 CUBE_ROTATIONS = _cube_rotation_group()
 
-class CubeSymmetryTransform(tio.Transform):
+class CubeSymmetryTransform:
     """
     Complete set of 24 rotational symmetries of a cube.
-    For each training pair, a random orientation is selected from the 24 possible 
-    rotational symmetries of a cube. Finally, a horizontal flip is applied with 
-    a 50% probability.
-    
+    A single random orientation is drawn from the 24 proper rotations of a cube
+    and applied identically to every tensor in the pair, followed by a 50%
+    horizontal flip — together covering the full 48-element octahedral group.
+
+    Operates directly on (C, D, H, W) tensors. The same random orientation is
+    applied to both members of the pair so the two noisy copies stay registered.
     Uses explicit permutation matrices for maximum robustness and performance.
     """
-    
+
     def _apply_rotation(self, tensor, rotation_idx):
         """Apply a specific rotation using permutation indices."""
         axes_perm, flip_dirs = CUBE_ROTATIONS[rotation_idx]
-        
+
         # Apply axis permutation
         tensor = tensor.permute(axes_perm)
-        
+
         # Apply flips for each axis
         for i, flip in enumerate(flip_dirs):
             if flip == -1:
                 tensor = tensor.flip(i)
-        
+
         return tensor
-    
-    def _geom_transform(self, tensors_to_transform):
-        """Apply one of 24 rotational symmetries + optional horizontal flip."""
+
+    def __call__(self, tensors):
+        """Apply one of 24 rotational symmetries + optional horizontal flip to
+        a list of (C, D, H, W) tensors, returning the transformed list."""
         # Randomly select one of 24 rotations
         rotation_idx = torch.randint(0, 24, [1]).item()
         # Random horizontal flip with 50% probability
         cur_h_flip = torch.randint(0, 2, [1]).item()
-        
-        for i in range(len(tensors_to_transform)):
-            tensors_to_transform[i] = torch.squeeze(tensors_to_transform[i])
-            # Shape: (D, H, W)
-            
+
+        for i in range(len(tensors)):
+            t = torch.squeeze(tensors[i])  # (C, D, H, W) -> (D, H, W)
+
             # Apply selected rotation
-            tensors_to_transform[i] = self._apply_rotation(tensors_to_transform[i], rotation_idx)
-            
-            # Randomly horizontally flip
+            t = self._apply_rotation(t, rotation_idx)
+
+            # Randomly horizontally flip (flips the last/W axis)
             if cur_h_flip == 1:
-                tensors_to_transform[i] = torchvision.transforms.functional.hflip(tensors_to_transform[i])
-            
-            tensors_to_transform[i] = torch.unsqueeze(tensors_to_transform[i], 0)
-        
-        return tensors_to_transform
-    
-    def apply_transform(self, subject):
-        """
-        Apply the selective symmetry transform to a TorchIO subject.
-        """
-        tensors = [
-            subject['split1_volume'].data,
-            subject['split2_volume'].data,
-        ]
+                t = t.flip(-1)
 
-        t1, t2 = self._geom_transform(tensors)
+            tensors[i] = torch.unsqueeze(t, 0)  # restore channel dim
 
-        subject['split1_volume'].set_data(t1)
-        subject['split2_volume'].set_data(t2)
-
-        return subject
+        return tensors
 
 
 def _parse_crop(crop, volume_shape):
@@ -503,16 +497,15 @@ class N2IDataset(Dataset):
             patch1 = (patch1 - self.mean) / (self.std + 1e-7)
             patch2 = (patch2 - self.mean) / (self.std + 1e-7)
 
-        # Apply cube symmetry transform
-        subject = tio.Subject(
-            split1_volume=tio.ScalarImage(tensor=patch1),
-            split2_volume=tio.ScalarImage(tensor=patch2)
-        )
-        subject = self.transform(subject)
-        
+        # Apply cube symmetry transform (same random orientation to both
+        # patches so the noisy pair stays registered). Returns plain tensors;
+        # the default DataLoader collate stacks them into a (B, 1, D, H, W)
+        # batch with no per-sample object-construction overhead.
+        patch1, patch2 = self.transform([patch1, patch2])
+
         return {
-            'split1_volume': subject['split1_volume'],
-            'split2_volume': subject['split2_volume']
+            'split1_volume': patch1,
+            'split2_volume': patch2,
         }
 
 
@@ -597,7 +590,7 @@ def _select_cuda_device(arg):
         free = [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
         if len(free) != n_visible:
             logging.warning(
-                f"--cuda_device auto: nvidia-smi reports {len(free)} GPUs but "
+                f"    --cuda_device auto: nvidia-smi reports {len(free)} GPUs but "
                 f"PyTorch sees {n_visible} (likely CUDA_VISIBLE_DEVICES is set); "
                 f"falling back to cuda:0 for safety."
             )
@@ -605,17 +598,24 @@ def _select_cuda_device(arg):
         idx = max(range(len(free)), key=lambda i: free[i])
         return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
     except (subprocess.SubprocessError, FileNotFoundError, ValueError) as e:
-        logging.warning(f"--cuda_device auto: nvidia-smi failed ({e}); falling back to 0")
+        logging.warning(f"    --cuda_device auto: nvidia-smi failed ({e}); falling back to 0")
         return 0, ""
 
 
 def save_model(model, optimizer, epoch, save_path):
-    """Save model checkpoint with PyTorch's built-in compression."""
+    """Save model checkpoint with PyTorch's built-in compression.
+
+    Saves the underlying (uncompiled) module's state_dict so checkpoints are
+    identical whether or not torch.compile wrapped the model. A compiled module
+    (OptimizedModule) otherwise prefixes every key with '_orig_mod.', which the
+    inference checkpoint loader does not expect.
+    """
+    base_model = getattr(model, "_orig_mod", model)
     state = {
         "epoch": int(epoch),
-        "state_dict": model.state_dict(),
+        "state_dict": base_model.state_dict(),
         "optimizer": optimizer.state_dict(),
-    }    
+    }
     # Use PyTorch's compression (recommended)
     torch.save(state, save_path, _use_new_zipfile_serialization=True)
 
@@ -631,7 +631,9 @@ def train_model(dl, model, loss_func, optimizer,
     if loaded_checkpoint_path is not None:
         logging.info("Loading weights...")
         state = _safe_torch_load(loaded_checkpoint_path, map_location=torch.device(device))
-        model.load_state_dict(state['state_dict'])
+        # Load into the underlying module so clean (unprefixed) checkpoint keys
+        # work whether or not the model has been wrapped by torch.compile.
+        getattr(model, "_orig_mod", model).load_state_dict(state['state_dict'])
         optimizer.load_state_dict(state['optimizer'])
         start_epoch_nb = state['epoch']+1
 
@@ -654,12 +656,15 @@ def train_model(dl, model, loss_func, optimizer,
     first_epoch_completed = False
     final_loss = float("nan")
     for epoch in range(start_epoch_nb, nb_train_epoch):
-        epoch_loss = 0
+        # Accumulate the loss on-device and sync once per epoch, rather than
+        # calling .item() every iteration (each .item() forces a GPU->CPU
+        # synchronization that serializes the training step).
+        epoch_loss_sum = torch.zeros((), device=device)
 
         for batch in tqdm(dl, desc=f'Epoch {epoch+1}/{nb_train_epoch}'):
             # Per-sample: with 50% probability swap which noisy copy is input vs. target
-            data1 = batch["split1_volume"][tio.DATA].to(device)
-            data2 = batch["split2_volume"][tio.DATA].to(device)
+            data1 = batch["split1_volume"].to(device, non_blocking=True)
+            data2 = batch["split2_volume"].to(device, non_blocking=True)
             swap = (torch.rand(data1.shape[0], device=device) < 0.5).view(-1, 1, 1, 1, 1)
             input = torch.where(swap, data2, data1)
             target = torch.where(swap, data1, data2)
@@ -681,8 +686,10 @@ def train_model(dl, model, loss_func, optimizer,
             scaler.scale(loss_val).backward()
             scaler.step(optimizer)
             scaler.update()
-            epoch_loss += loss_val.item() / len(dl)
+            epoch_loss_sum += loss_val.detach()
 
+        # One device sync per epoch to read back the mean loss.
+        epoch_loss = (epoch_loss_sum / len(dl)).item()
         logging.info(f"Mean loss value of the epoch : {epoch_loss:.4f}")
         loss_csv.write(f"{epoch},{epoch_loss:.6f}\n")
         loss_csv.flush()
@@ -757,35 +764,66 @@ def main(params):
     # After this, params.cuda_device is always a concrete int.
     params.cuda_device, cuda_info = _select_cuda_device(params.cuda_device)
 
-    # Determine device
+    # Determine device + resolve every GPU-capability-gated decision (fp16,
+    # torch.compile) in one block so adjacent log lines tell the user exactly
+    # what's actually enabled on this hardware. Mirrors inference.py's layout.
+    logging.info("Configuring device and precision...")
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{params.cuda_device}")
-        msg = f"Using GPU device: cuda:{params.cuda_device}"
+        msg = f"    Using GPU device: cuda:{params.cuda_device}"
         if cuda_info:
             msg += f" ({cuda_info})"
         logging.info(msg)
+        compute_major, compute_minor = torch.cuda.get_device_capability(device)
     else:
         device = torch.device("cpu")
-        logging.info("CUDA not available, using CPU")
+        logging.info("    CUDA not available, using CPU")
+        compute_major, compute_minor = 0, 0
 
     # fp16 mixed-precision training requires CUDA and a tensor-core-capable
     # GPU (compute capability >= 7.0: Volta/Turing/Ampere/Ada/Hopper). On
     # older cards (e.g. Pascal GTX 10-series) fp16 throughput is much lower
     # than fp32, so autocast would slow training down.
     use_amp = False
-    if not params.no_half and device.type == "cuda":
-        major, minor = torch.cuda.get_device_capability(device)
-        if major >= 7:
-            use_amp = True
-            logging.info(f"Mixed precision (fp16): enabled (compute capability {major}.{minor})")
-        else:
-            logging.info(
-                f"Mixed precision (fp16): disabled — GPU compute capability "
-                f"{major}.{minor} lacks tensor cores; fp16 would run slower than fp32"
-            )
+    if not params.no_half and device.type == "cuda" and compute_major >= 7:
+        use_amp = True
+        logging.info(
+            f"    Mixed precision (fp16): enabled "
+            f"(compute capability {compute_major}.{compute_minor})"
+        )
     else:
-        logging.info("Mixed precision (fp16): disabled")
-    
+        if params.no_half:
+            reason = "--no_half"
+        elif device.type != "cuda":
+            reason = "CPU"
+        else:
+            reason = (
+                f"compute capability {compute_major}.{compute_minor} lacks "
+                f"tensor cores; fp16 would run slower than fp32"
+            )
+        logging.info(f"    Mixed precision (fp16): disabled ({reason})")
+
+    # torch.compile: needs PyTorch 2.0+ + CUDA + compute capability >= 7.0
+    # (Triton, the inductor backend, refuses to compile for compute < 7.0).
+    # The decision and its log line are resolved here; the wrap itself is
+    # applied later (after params.json is written and the optimizer is created).
+    if params.no_compile:
+        use_compile = False
+        logging.info("    torch.compile: disabled (--no_compile)")
+    elif not hasattr(torch, "compile"):
+        use_compile = False
+        logging.info("    torch.compile: disabled (PyTorch < 2.0)")
+    elif device.type != "cuda" or compute_major < 7:
+        use_compile = False
+        logging.info(
+            f"    torch.compile: disabled "
+            f"(compute capability {compute_major}.x lacks Triton backend support; requires >= 7.0)"
+        )
+    else:
+        use_compile = True
+        logging.info("    torch.compile: enabled (will compile on first training step)")
+
+
     # Initialize the model to be trained
     model = create_model(device=params.cuda_device if torch.cuda.is_available() else 'cpu',
                         norm_division_factor=getattr(params, 'norm_division_factor', 1))
@@ -807,6 +845,9 @@ def main(params):
         num_workers=params.num_workers,
         persistent_workers=params.num_workers > 0,
         worker_init_fn=_worker_init_fn if params.num_workers > 0 else None,
+        # Page-locked host buffers let the .to(device, non_blocking=True) copy
+        # in the training loop overlap with compute. Only meaningful with CUDA.
+        pin_memory=torch.cuda.is_available(),
     )
 
     # Create loss function and optimizer. MSE is the N2N default and recovers
@@ -860,6 +901,20 @@ def main(params):
         json.dump(params_dict, par_file)
     logging.info(f"Saved training parameters with normalization statistics: mean={train_dataset.mean:.6f}, std={train_dataset.std:.6f}")
 
+    # Apply the already-resolved torch.compile decision (use_compile was set and
+    # logged in the device/precision block above). The wrap is done here, after
+    # params.json is written (which reads model.unet.*) and after the optimizer
+    # is created (the compiled module shares the same parameter tensors, so the
+    # optimizer keeps updating the right weights). Training uses a fixed 96^3
+    # patch shape, so the model compiles once on the first step with no later
+    # recompiles. Checkpoints stay compile-agnostic because save_model unwraps
+    # _orig_mod. The wrap can still raise on edge cases; fall back to eager mode.
+    if use_compile:
+        try:
+            model = torch.compile(model)
+        except Exception as e:
+            logging.warning(f"    torch.compile failed at wrap time; using eager mode: {e}")
+
     # Train model
     stats = train_model(
         train_loader,
@@ -899,6 +954,7 @@ if __name__ == "__main__":
     parse.add_argument('--norm_division_factor', default=56, type=int, help="Division factor for group normalization. 56 (default) = layer norm (num_groups=1), the best pairing with residual learning; 1 = instance norm (num_groups=56); intermediate divisors of 56 give true group norm. Special value 0 disables normalization entirely (experimental; relies on the U-Net's skip connections and the residual wrapper for stability). Valid values: 0, 1, 2, 4, 7, 8, 14, 28, 56.")
     parse.add_argument('--num_workers', default=4, type=int, help="Number of DataLoader worker processes (default: 4; use 0 on very low-RAM systems)")
     parse.add_argument('--no_half', action='store_true', help="Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0)")
+    parse.add_argument('--no_compile', action='store_true', help="Disable torch.compile (default: enabled when PyTorch 2.0+ is available and the GPU has compute capability >= 7.0; gives ~1.2-1.5x training speedup after a one-time compilation on the first step)")
     parse.add_argument('--keep_only_last', action='store_true', help="Keep only the most recent epoch's checkpoint on disk; delete previous ones after each save (default: keep every epoch)")
     parse.add_argument('--loss', default='mse', choices=('mse', 'l1'), help="Loss function: 'mse' (default, recovers conditional mean) or 'l1' (recovers conditional median for symmetric noise; often produces sharper edges)")
 

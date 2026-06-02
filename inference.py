@@ -22,6 +22,15 @@ warnings.filterwarnings(
 )
 
 
+# Enable cuDNN autotuning and TF32. Sliding-window inference runs a fixed roi
+# size, so cuDNN's benchmark mode quickly settles on the fastest conv algorithm.
+# TF32 (Ampere+; a no-op on older cards) accelerates fp32 paths at precision
+# that is irrelevant for denoising.
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
 # AMP API compatibility: PyTorch 2.0+ exposes torch.autocast (device-agnostic),
 # while older PyTorch (~1.6 to ~1.13) exposes torch.cuda.amp.autocast. Both are
 # functionally equivalent for our usage; we pick whichever is available so the
@@ -134,7 +143,7 @@ def _select_cuda_device(arg):
         free = [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
         if len(free) != n_visible:
             logging.warning(
-                f"--cuda_device auto: nvidia-smi reports {len(free)} GPUs but "
+                f"    --cuda_device auto: nvidia-smi reports {len(free)} GPUs but "
                 f"PyTorch sees {n_visible} (likely CUDA_VISIBLE_DEVICES is set); "
                 f"falling back to cuda:0 for safety."
             )
@@ -142,7 +151,7 @@ def _select_cuda_device(arg):
         idx = max(range(len(free)), key=lambda i: free[i])
         return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
     except (subprocess.SubprocessError, FileNotFoundError, ValueError) as e:
-        logging.warning(f"--cuda_device auto: nvidia-smi failed ({e}); falling back to 0")
+        logging.warning(f"    --cuda_device auto: nvidia-smi failed ({e}); falling back to 0")
         return 0, ""
 
 def _load_and_preprocess_volume(volume_path: str, mean_std_norm: Optional[Tuple[float, float]] = None) -> Tuple[torch.Tensor, float, float]:
@@ -195,7 +204,6 @@ def _load_and_preprocess_volume(volume_path: str, mean_std_norm: Optional[Tuple[
             tensor = tensor.cuda()
             logging.info("    Moved volume tensor to GPU")
         
-        logging.info("Loaded and preprocessed volume")
         return tensor, mean, std
 
     except Exception as e:
@@ -252,8 +260,7 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> torch.nn.Mo
         
         # Set model to evaluation mode
         model.eval()
-        
-        logging.info(f"Successfully loaded checkpoint from {checkpoint_path}")
+
         return model
     except Exception as e:
         raise RuntimeError(f"Failed to load checkpoint: {e}")
