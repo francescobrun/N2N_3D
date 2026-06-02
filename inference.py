@@ -709,9 +709,26 @@ def main(args) -> None:
         norm_division_factor = network_params.get('norm_division_factor', 1)
         logging.info(f"    Using norm_division_factor: {norm_division_factor}")
 
+        # num_res_units must match training so the architecture (and thus the
+        # state_dict keys) line up. Falls back to 0 (plain conv block per level)
+        # for legacy checkpoints that predate the field.
+        num_res_units = network_params.get('num_res_units', 0)
+        logging.info(f"    Using num_res_units: {num_res_units}")
+
+        # unet_depth / unet_stride must match training so the architecture (and
+        # thus the state_dict keys) line up. Fall back to the original
+        # (56,112,224,448) stride-2 geometry for legacy checkpoints that predate
+        # these fields.
+        unet_depth = network_params.get('unet_depth', 4)
+        unet_stride = network_params.get('unet_stride', 2)
+        logging.info(f"    Using unet_depth: {unet_depth}, unet_stride: {unet_stride}")
+
         model = create_model(
             device=cuda_device if torch.cuda.is_available() else 'cpu',
-            norm_division_factor=norm_division_factor
+            norm_division_factor=norm_division_factor,
+            num_res_units=num_res_units,
+            unet_depth=unet_depth,
+            unet_stride=unet_stride
         )
 
         # Load the trained weights from checkpoint
@@ -816,7 +833,7 @@ if __name__ == "__main__":
     # Optional arguments with default values
     parse.add_argument('--batch_size', default=4, type=int, help='The number of patches per batch')
     parse.add_argument('--cuda_device', default='auto', type=_cuda_device_arg, help="CUDA device to use: a non-negative integer or 'auto' (picks the GPU with the most free memory via nvidia-smi). Default: auto.")
-    parse.add_argument('--overlap', default=0.85, type=float, help='Overlap ratio between patches for sliding window inference')
+    parse.add_argument('--overlap', default=0.5, type=float, help='Overlap ratio between patches for sliding window inference')
     parse.add_argument('--no_compression', action='store_true', help='Disable compression in output TIFF files (default: enabled)')
     parse.add_argument('--no_half', action='store_true', help='Disable fp16 mixed precision inference (default: enabled when CUDA is available)')
     parse.add_argument('--no_compile', action='store_true', help='Disable torch.compile (default: enabled when PyTorch 2.0+ is available; gives ~1.2-1.5x speedup after one-time compilation overhead)')

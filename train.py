@@ -826,7 +826,10 @@ def main(params):
 
     # Initialize the model to be trained
     model = create_model(device=params.cuda_device if torch.cuda.is_available() else 'cpu',
-                        norm_division_factor=getattr(params, 'norm_division_factor', 1))
+                        norm_division_factor=getattr(params, 'norm_division_factor', 1),
+                        num_res_units=getattr(params, 'num_res_units', 0),
+                        unet_depth=getattr(params, 'unet_depth', 4),
+                        unet_stride=getattr(params, 'unet_stride', 2))
 
     # Create the memory-efficient data loading pipeline
     logging.info("Setting up data loader...")
@@ -951,7 +954,10 @@ if __name__ == "__main__":
     parse.add_argument('--nb_train_epoch', default=50, type=int, help="The number of training epochs")
     parse.add_argument('--batch_size', default=16, type=int, help="The number of patch per batch")
     parse.add_argument('--cuda_device', default='auto', type=_cuda_device_arg, help="CUDA device to use: a non-negative integer or 'auto' (picks the GPU with the most free memory via nvidia-smi). Default: auto.")
-    parse.add_argument('--norm_division_factor', default=56, type=int, help="Division factor for group normalization. 56 (default) = layer norm (num_groups=1), the best pairing with residual learning; 1 = instance norm (num_groups=56); intermediate divisors of 56 give true group norm. Special value 0 disables normalization entirely (experimental; relies on the U-Net's skip connections and the residual wrapper for stability). Valid values: 0, 1, 2, 4, 7, 8, 14, 28, 56.")
+    parse.add_argument('--num_res_units', default=0, type=int, help="Number of residual conv units per level inside the MONAI U-Net (default: 0, a plain conv block per level). This is MONAI's intra-block residual learning, distinct from the image-level residual wrapper. Values of 1 or 2 add deeper per-level blocks with internal skip connections, which can improve denoising fidelity / edge sharpness at the cost of more compute, memory, and parameters. Recorded in params.json so inference reconstructs the matching architecture.")
+    parse.add_argument('--unet_depth', default=4, type=int, help="Number of U-Net levels (default: 4). Channels start at 56 and double per level, so depth 4 = (56,112,224,448) and depth 3 = (56,112,224); there are unet_depth-1 downsampling stages. Fewer levels keep detail at a finer resolution (less of the smoothing caused by the coarse bottleneck) but shrink the receptive field; more levels widen context at the cost of more downsampling. Must be >= 2. Recorded in params.json so inference reconstructs the matching architecture.")
+    parse.add_argument('--unet_stride', default=2, type=int, help="Downsampling factor applied uniformly at every U-Net stage (default: 2). Set to 1 for a no-downsampling, full-resolution network: the sharpest option since no spatial information is lost, but dramatically more memory- and compute-hungry. Must be >= 1. Recorded in params.json so inference reconstructs the matching architecture.")
+    parse.add_argument('--norm_division_factor', default=56, type=int, help="Division factor for group normalization. 56 (default) = layer norm (num_groups=1), the best pairing with residual learning; 1 = instance norm (num_groups=56); intermediate divisors of 56 give true group norm. Valid values: 1, 2, 4, 7, 8, 14, 28, 56.")
     parse.add_argument('--num_workers', default=4, type=int, help="Number of DataLoader worker processes (default: 4; use 0 on very low-RAM systems)")
     parse.add_argument('--no_half', action='store_true', help="Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0)")
     parse.add_argument('--no_compile', action='store_true', help="Disable torch.compile (default: enabled when PyTorch 2.0+ is available and the GPU has compute capability >= 7.0; gives ~1.2-1.5x training speedup after a one-time compilation on the first step)")

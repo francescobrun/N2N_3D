@@ -109,7 +109,10 @@ python train.py path/to/your/config.json
 - `--nb_train_epoch`: Number of training epochs (default: 50)
 - `--batch_size`: Number of patches per batch (default: 16)
 - `--cuda_device`: CUDA device to use. A non-negative integer selects that specific GPU; the string `auto` (default) picks the GPU with the most free memory via `nvidia-smi`. Useful on shared multi-GPU machines to avoid colliding with other users. Falls back to GPU 0 if `nvidia-smi` is unavailable.
-- `--norm_division_factor`: Division factor for group normalization (default: 56, i.e. layer normalization — num_groups=1). Empirically the best pairing with the residual learning wrapper because it preserves inter-channel structure that helps signal/noise discrimination. Setting it to 1 selects instance normalization (num_groups=56); intermediate divisors of 56 give true group normalization. **Special value 0** disables normalization entirely (`norm=None` in MONAI's UNet) — the network then relies on its skip connections and the residual wrapper for training stability. This is experimental: modern normalization-free networks can work well, but training may converge more slowly or fail to converge cleanly depending on the data, so verify with a short run before committing to it. Valid values: 0, 1, 2, 4, 7, 8, 14, 28, 56.
+- `--norm_division_factor`: Division factor for group normalization (default: 56, i.e. layer normalization — num_groups=1). Empirically the best pairing with the residual learning wrapper because it preserves inter-channel structure that helps signal/noise discrimination. Setting it to 1 selects instance normalization (num_groups=56); intermediate divisors of 56 give true group normalization. Valid values: 1, 2, 4, 7, 8, 14, 28, 56.
+- `--num_res_units`: Number of residual conv units per level inside the MONAI U-Net (default: 0, a plain conv block per level). This is MONAI's *intra-block* residual learning and is distinct from the image-level residual wrapper (`output = input + unet(input)`) that is always active. Values of `1` or `2` add deeper per-level blocks with internal skip connections, which can improve denoising fidelity and edge sharpness (helpful if outputs look over-smoothed) at the cost of more compute, memory, and parameters — so adjust batch size accordingly and **requires retraining**. The value is recorded in `params.json` and read back automatically at inference time so the reconstructed architecture matches the trained one.
+- `--unet_depth`: Number of U-Net levels (default: 4). Channels start at 56 and double per level, so depth 4 = (56, 112, 224, 448) and depth 3 = (56, 112, 224); there are `unet_depth - 1` downsampling stages. **Fewer levels** keep detail at a finer resolution and reduce the smoothing that comes from the coarse bottleneck (helpful for sharpness) but shrink the receptive field; **more levels** widen spatial context at the cost of more downsampling. Must be >= 2 and **requires retraining**. Recorded in `params.json` and read back automatically at inference.
+- `--unet_stride`: Downsampling factor applied uniformly at every U-Net stage (default: 2). **Set to 1** for a no-downsampling, full-resolution network (MSD-like): the sharpest option since no spatial information is lost, but dramatically more memory- and compute-hungry — reduce `--batch_size` accordingly. Must be >= 1 and **requires retraining**. Recorded in `params.json` and read back automatically at inference.
 - `--no_half`: Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0). Automatically skipped on older cards (GTX 10-series / Pascal) where fp16 would be slower than fp32.
 - `--no_compile`: Disable `torch.compile` (default: enabled when PyTorch 2.0+ is available **and** the GPU has compute capability >= 7.0). When enabled, the model is graph-compiled before training for a ~1.2-1.5x speedup; the first training step is slower while compilation runs. Automatically skipped on Pascal and earlier (compute < 7.0) where the Triton backend is unsupported, and falls back to eager mode if PyTorch is older than 2.0 or compilation raises. Checkpoints are written in the same format regardless, so inference can load them either way.
 - `--keep_only_last`: Keep only the most recent epoch's checkpoint on disk; the previous epoch's `weights_epoch_NNN.torch` is deleted after each save (default: every epoch is preserved, useful for testing/ablation).
@@ -130,9 +133,6 @@ python train.py config.json --norm_division_factor 1
 # Training with intermediate group normalization (e.g. 14 groups)
 python train.py config.json --norm_division_factor 4
 
-# Training with no normalization at all (experimental — verify convergence on a short run first)
-python train.py config.json --norm_division_factor 0
-
 # Resume training from checkpoint
 python train.py config.json --loaded_checkpoint_path checkpoints/weights_epoch_020.torch
 ```
@@ -145,13 +145,13 @@ python inference.py path/to/your/config.json
 
 **Note**: Inference will automatically use the latest checkpoint available in the checkpoint directory.
 
-**Note**: Inference runtime depends strongly on the `--overlap` setting and the test volume size. At the default overlap of 0.85 on a large volume (e.g. ~400×500×1000 voxels), expect a few hours on a consumer GPU; on smaller volumes or with a larger `--batch_size`, runtime drops accordingly. fp16 mixed precision (enabled by default on tensor-core GPUs) further reduces it.
+**Note**: Inference runtime depends strongly on the `--overlap` setting and the test volume size, since patch count scales roughly as `1/(1-overlap)³`. At the default overlap of 0.5 on a large volume (e.g. ~400×500×1000 voxels), expect well under an hour on a consumer GPU; raising it (e.g. to 0.85) improves blending at the seams but multiplies runtime several-fold. On smaller volumes or with a larger `--batch_size`, runtime drops accordingly. fp16 mixed precision (enabled by default on tensor-core GPUs) further reduces it. The image-level residual wrapper keeps seams small even at low overlap, so 0.5 is a good speed/quality default.
 
 #### Optional Arguments:
 
 - `--batch_size`: Number of patches processed simultaneously (default: 4)
 - `--cuda_device`: CUDA device to use. A non-negative integer selects that specific GPU; the string `auto` (default) picks the GPU with the most free memory via `nvidia-smi`. Useful on shared multi-GPU machines to avoid colliding with other users. Falls back to GPU 0 if `nvidia-smi` is unavailable.
-- `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.85)
+- `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.5). Higher values reduce patch-boundary seams but increase runtime sharply (patch count scales ~`1/(1-overlap)³`); lower values are faster with slightly more risk of visible seams.
 - `--no_compression`: Disable compression in output TIFF files (default: enabled)
 - `--no_half`: Disable fp16 mixed precision inference (default: enabled on tensor-core GPUs only). fp16 is automatically skipped on older GPUs without tensor cores (compute capability < 7.0, e.g. GTX 10-series / Pascal), where fp16 would be slower than fp32.
 - `--no_compile`: Disable `torch.compile` (default: enabled when PyTorch 2.0+ is available **and** the GPU has compute capability >= 7.0). When enabled, the model is graph-compiled before inference for ~1.2-1.5x speedup; the first inference call is slower (typically 30-90s) while compilation runs. Automatically skipped on Pascal and earlier (GTX 10-series, compute < 7.0) because `torch.compile`'s Triton backend doesn't support those cards. Also falls back to eager mode if PyTorch is older than 2.0 or compilation raises.
@@ -169,8 +169,8 @@ python inference.py config.json
 # Inference with larger batch size (uses more memory)
 python inference.py config.json --batch_size 8
 
-# Inference with custom overlap (lower overlap = less quality but faster)
-python inference.py config.json --overlap 0.5
+# Inference with higher overlap (smoother seam blending but slower)
+python inference.py config.json --overlap 0.85
 
 # Inference without compression (larger output file size)
 python inference.py config.json --no_compression
