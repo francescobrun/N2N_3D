@@ -32,8 +32,9 @@ class ResidualUNet(torch.nn.Module):
         return x + self.unet(x)
 
 
-def create_model(device=0, norm_division_factor=56, num_res_units=0,
-                 unet_depth=4, unet_stride=2):
+def create_model(
+    device=0, norm_division_factor=56, num_res_units=0, unet_depth=4, unet_stride=2
+):
     """
     Create a 3D U-Net model with configurable normalization, wrapped in
     image-level residual learning mode (output = input + unet(input)).
@@ -83,7 +84,7 @@ def create_model(device=0, norm_division_factor=56, num_res_units=0,
         raise ValueError(f"unet_stride must be an integer >= 1, got {unet_stride}")
 
     first_channels = 56
-    channels = tuple(first_channels * (2 ** i) for i in range(unet_depth))
+    channels = tuple(first_channels * (2**i) for i in range(unet_depth))
     strides = (unet_stride,) * (unet_depth - 1)
 
     if not isinstance(norm_division_factor, int) or norm_division_factor < 1:
@@ -117,7 +118,7 @@ def create_model(device=0, norm_division_factor=56, num_res_units=0,
     model = ResidualUNet(unet)
 
     # Handle device setup
-    if torch.cuda.is_available() and device != 'cpu':
-        model = model.to(f'cuda:{device}')
+    if torch.cuda.is_available() and device != "cpu":
+        model = model.to(f"cuda:{device}")
 
     return model

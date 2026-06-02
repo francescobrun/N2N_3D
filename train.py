@@ -30,16 +30,23 @@ torch.backends.cudnn.allow_tf32 = True
 # Both implementations are functionally equivalent for our usage; we pick whichever
 # the installed version provides so the pipeline runs on older toolchains too.
 if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+
     def _make_gradscaler(enabled):
         return torch.amp.GradScaler("cuda", enabled=enabled)
+
 else:
+
     def _make_gradscaler(enabled):
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
+
 if hasattr(torch, "autocast"):
+
     def _amp_autocast(enabled):
         return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=enabled)
+
 else:
+
     def _amp_autocast(enabled):
         return torch.cuda.amp.autocast(enabled=enabled)
 
@@ -49,6 +56,7 @@ else:
 # argument doesn't exist and passing it raises TypeError. Detect once and call
 # torch.load with or without the kwarg accordingly.
 import inspect as _inspect
+
 _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = (
     "weights_only" in _inspect.signature(torch.load).parameters
 )
@@ -70,8 +78,8 @@ def setup_logging() -> None:
     """
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        format="%(asctime)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
 
@@ -91,6 +99,7 @@ WEIGHT_DECAY = 0.0  # Weight decay coefficient for L2 regularization
 # ============================================================================
 # CUSTOM TRANSFORMS AND DATASET CLASSES
 # ============================================================================
+
 
 def _cube_rotation_group():
     """Return the 24 proper rotations of the cube as (axes_perm, sign_flips).
@@ -113,6 +122,7 @@ def _cube_rotation_group():
 
 
 CUBE_ROTATIONS = _cube_rotation_group()
+
 
 class CubeSymmetryTransform:
     """
@@ -247,9 +257,7 @@ def _parse_circle_mask(mask, volume_shape, training_patch_size):
     else:
         radius = float(raw_radius)
     if radius <= 0:
-        raise ValueError(
-            f"training_circle_mask['radius'] must be > 0 (got {radius})"
-        )
+        raise ValueError(f"training_circle_mask['radius'] must be > 0 (got {radius})")
 
     center_y = float(mask.get("center_y", (H - 1) / 2.0))
     center_x = float(mask.get("center_x", (W - 1) / 2.0))
@@ -281,16 +289,18 @@ class N2IDataset(Dataset):
     Noise2Inverse dataset that preloads both volumes into memory for fast training.
     Both split volumes are loaded during initialization for efficient patch access.
     """
-    
-    def __init__(self, dataset_name, training_patch_size, nb_patches, normalization=True):
-        
-        # Load dataset metadata       
-        with open(dataset_name, 'r') as f:
+
+    def __init__(
+        self, dataset_name, training_patch_size, nb_patches, normalization=True
+    ):
+
+        # Load dataset metadata
+        with open(dataset_name, "r") as f:
             dataset_info = json.load(f)
-        
+
         split1_path = dataset_info["split1_volume_file"]
         split2_path = dataset_info["split2_volume_file"]
-        
+
         # Preload both volumes into memory
         logging.info("Loading training volumes into memory...")
         self.split1_volume = tifffile.imread(split1_path).astype(np.float32)
@@ -376,10 +386,8 @@ class N2IDataset(Dataset):
         # volumes are both fine for N2N training but worth being aware of.
         unique_positions = 1
         for vs, ps in zip(self.volume_shape, training_patch_size):
-            unique_positions *= (vs - ps + 1)
-        logging.info(
-            f"Volume size: {'×'.join(str(s) for s in self.volume_shape)}"
-        )
+            unique_positions *= vs - ps + 1
+        logging.info(f"Volume size: {'×'.join(str(s) for s in self.volume_shape)}")
         logging.info(
             f"Unique patch start positions: {unique_positions:.2e} "
             f"(patches/epoch: {nb_patches}, coverage per epoch: "
@@ -406,8 +414,7 @@ class N2IDataset(Dataset):
                 H, W = self.volume_shape[1], self.volume_shape[2]
                 y_grid, x_grid = np.ogrid[:H, :W]
                 yx_mask = (
-                    (y_grid - self._circle_cy) ** 2
-                    + (x_grid - self._circle_cx) ** 2
+                    (y_grid - self._circle_cy) ** 2 + (x_grid - self._circle_cx) ** 2
                 ) <= self._circle_r2
                 in_circle_1 = self.split1_volume[:, yx_mask]
                 in_circle_2 = self.split2_volume[:, yx_mask]
@@ -441,7 +448,11 @@ class N2IDataset(Dataset):
         standard imaging convention corresponds to (z, y, x).
         """
         z, y, x = start_coords
-        patch = volume[z:z+self.patch_size[0], y:y+self.patch_size[1], x:x+self.patch_size[2]].clone()
+        patch = volume[
+            z : z + self.patch_size[0],
+            y : y + self.patch_size[1],
+            x : x + self.patch_size[2],
+        ].clone()
         return patch.unsqueeze(0)  # Add channel dimension
 
     def _patch_inside_circle(self, start_y, start_x):
@@ -504,10 +515,9 @@ class N2IDataset(Dataset):
         patch1, patch2 = self.transform([patch1, patch2])
 
         return {
-            'split1_volume': patch1,
-            'split2_volume': patch2,
+            "split1_volume": patch1,
+            "split2_volume": patch2,
         }
-
 
 
 def _worker_init_fn(worker_id):
@@ -529,14 +539,14 @@ def _cuda_device_arg(s):
         value = int(s)
     except ValueError:
         import argparse
+
         raise argparse.ArgumentTypeError(
             f"--cuda_device must be 'auto' or an integer, got {s!r}"
         )
     if value < 0:
         import argparse
-        raise argparse.ArgumentTypeError(
-            f"--cuda_device must be >= 0, got {value}"
-        )
+
+        raise argparse.ArgumentTypeError(f"--cuda_device must be >= 0, got {value}")
     return value
 
 
@@ -572,7 +582,7 @@ def _select_cuda_device(arg):
         free = []
         for i in range(n_visible):
             free_bytes, _ = torch.cuda.mem_get_info(i)
-            free.append(free_bytes // (1024 ** 2))
+            free.append(free_bytes // (1024**2))
         idx = max(range(len(free)), key=lambda i: free[i])
         return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
     except AttributeError:
@@ -583,6 +593,7 @@ def _select_cuda_device(arg):
     # restricting PyTorch and the indices would be mis-mapped.
     try:
         import subprocess
+
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
             text=True,
@@ -598,7 +609,9 @@ def _select_cuda_device(arg):
         idx = max(range(len(free)), key=lambda i: free[i])
         return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
     except (subprocess.SubprocessError, FileNotFoundError, ValueError) as e:
-        logging.warning(f"    --cuda_device auto: nvidia-smi failed ({e}); falling back to 0")
+        logging.warning(
+            f"    --cuda_device auto: nvidia-smi failed ({e}); falling back to 0"
+        )
         return 0, ""
 
 
@@ -620,9 +633,18 @@ def save_model(model, optimizer, epoch, save_path):
     torch.save(state, save_path, _use_new_zipfile_serialization=True)
 
 
-def train_model(dl, model, loss_func, optimizer,
-                checkpoint_dir, loaded_checkpoint_path, nb_train_epoch, device,
-                use_amp, keep_only_last):
+def train_model(
+    dl,
+    model,
+    loss_func,
+    optimizer,
+    checkpoint_dir,
+    loaded_checkpoint_path,
+    nb_train_epoch,
+    device,
+    use_amp,
+    keep_only_last,
+):
     """Train the model with logic similar to train_old.py."""
 
     start_epoch_nb = 0
@@ -630,12 +652,14 @@ def train_model(dl, model, loss_func, optimizer,
     # Load checkpoint if specified
     if loaded_checkpoint_path is not None:
         logging.info("Loading weights...")
-        state = _safe_torch_load(loaded_checkpoint_path, map_location=torch.device(device))
+        state = _safe_torch_load(
+            loaded_checkpoint_path, map_location=torch.device(device)
+        )
         # Load into the underlying module so clean (unprefixed) checkpoint keys
         # work whether or not the model has been wrapped by torch.compile.
-        getattr(model, "_orig_mod", model).load_state_dict(state['state_dict'])
-        optimizer.load_state_dict(state['optimizer'])
-        start_epoch_nb = state['epoch']+1
+        getattr(model, "_orig_mod", model).load_state_dict(state["state_dict"])
+        optimizer.load_state_dict(state["optimizer"])
+        start_epoch_nb = state["epoch"] + 1
 
     # GradScaler prevents fp16 gradient underflow during backward. When
     # use_amp=False it's a no-op (passes through scale/step/update calls).
@@ -646,7 +670,11 @@ def train_model(dl, model, loss_func, optimizer,
     # On resume (start_epoch_nb > 0) we append to the existing file; on a
     # fresh run we (re)write the header.
     loss_csv_path = checkpoint_dir / "training_loss.csv"
-    write_header = start_epoch_nb == 0 or not loss_csv_path.exists() or loss_csv_path.stat().st_size == 0
+    write_header = (
+        start_epoch_nb == 0
+        or not loss_csv_path.exists()
+        or loss_csv_path.stat().st_size == 0
+    )
     loss_csv = open(loss_csv_path, "w" if write_header else "a")
     if write_header:
         loss_csv.write("epoch,mean_loss\n")
@@ -661,11 +689,13 @@ def train_model(dl, model, loss_func, optimizer,
         # synchronization that serializes the training step).
         epoch_loss_sum = torch.zeros((), device=device)
 
-        for batch in tqdm(dl, desc=f'Epoch {epoch+1}/{nb_train_epoch}'):
+        for batch in tqdm(dl, desc=f"Epoch {epoch+1}/{nb_train_epoch}"):
             # Per-sample: with 50% probability swap which noisy copy is input vs. target
             data1 = batch["split1_volume"].to(device, non_blocking=True)
             data2 = batch["split2_volume"].to(device, non_blocking=True)
-            swap = (torch.rand(data1.shape[0], device=device) < 0.5).view(-1, 1, 1, 1, 1)
+            swap = (torch.rand(data1.shape[0], device=device) < 0.5).view(
+                -1, 1, 1, 1, 1
+            )
             input = torch.where(swap, data2, data1)
             target = torch.where(swap, data1, data2)
 
@@ -711,7 +741,9 @@ def train_model(dl, model, loss_func, optimizer,
 
         # Save checkpoint at each epoch
         logging.info("Saving checkpoint for epoch n°{}...".format(epoch))
-        save_model(model, optimizer, epoch, checkpoint_dir / f"weights_epoch_{epoch:03d}.torch")
+        save_model(
+            model, optimizer, epoch, checkpoint_dir / f"weights_epoch_{epoch:03d}.torch"
+        )
 
         # If keep_only_last is set, delete the previous epoch's checkpoint
         # after the new one is safely on disk. Resume-from-checkpoint still
@@ -741,9 +773,11 @@ def train_model(dl, model, loss_func, optimizer,
         "epochs_completed": max(0, nb_train_epoch - start_epoch_nb),
     }
 
+
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
+
 
 def main(params):
     """Main training function."""
@@ -753,9 +787,9 @@ def main(params):
     # Capture wall-clock start so the end-of-run summary can report total time.
     start_time = time.time()
 
-    with open(params.input_json, 'r') as f:
+    with open(params.input_json, "r") as f:
         dataset_info = json.load(f)
-    
+
     # Get checkpoint directory from JSON and create it if it doesn't exist
     checkpoint_dir = Path(dataset_info["checkpoint_path"])
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
@@ -825,25 +859,25 @@ def main(params):
         )
     else:
         use_compile = True
-        logging.info("    torch.compile: enabled (--compile; will compile on first training step)")
-
+        logging.info(
+            "    torch.compile: enabled (--compile; will compile on first training step)"
+        )
 
     # Initialize the model to be trained
-    model = create_model(device=params.cuda_device if torch.cuda.is_available() else 'cpu',
-                        norm_division_factor=getattr(params, 'norm_division_factor', 1),
-                        num_res_units=getattr(params, 'num_res_units', 0),
-                        unet_depth=getattr(params, 'unet_depth', 4),
-                        unet_stride=getattr(params, 'unet_stride', 2))
+    model = create_model(
+        device=params.cuda_device if torch.cuda.is_available() else "cpu",
+        norm_division_factor=getattr(params, "norm_division_factor", 1),
+        num_res_units=getattr(params, "num_res_units", 0),
+        unet_depth=getattr(params, "unet_depth", 4),
+        unet_stride=getattr(params, "unet_stride", 2),
+    )
 
     # Create the memory-efficient data loading pipeline
     logging.info("Setting up data loader...")
     train_dataset = N2IDataset(
-        params.input_json,
-        TRAIN_PATCH_SIZE,
-        NB_PATCH_PER_EPOCH,
-        normalization=True 
+        params.input_json, TRAIN_PATCH_SIZE, NB_PATCH_PER_EPOCH, normalization=True
     )
-    
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=params.batch_size,
@@ -857,56 +891,61 @@ def main(params):
         pin_memory=torch.cuda.is_available(),
     )
 
-    # Create loss function and optimizer. MSE is the N2N default and recovers
-    # the conditional mean of the clean signal. L1 also satisfies the N2N
-    # convergence requirement for symmetric noise (recovers the conditional
-    # median, which equals the mean for symmetric distributions) and tends to
-    # produce visibly sharper edges by penalizing large residuals less harshly.
-    loss_classes = {"mse": torch.nn.MSELoss, "l1": torch.nn.L1Loss}
-    loss_func = loss_classes[params.loss]()
-    optimizer = torch.optim.Adam(model.parameters(), weight_decay=WEIGHT_DECAY, lr=LEARNING_RATE)
+    # Create loss function and optimizer. MSE is the N2N estimator for zero-mean
+    # noise: it recovers the conditional mean of the clean signal and converges
+    # to a spatially consistent solution. (L1 recovers the conditional median,
+    # which is biased on asymmetric noise and produced patch-grid block
+    # artifacts on this data, so it is not offered.)
+    loss_func = torch.nn.MSELoss()
+    optimizer = torch.optim.Adam(
+        model.parameters(), weight_decay=WEIGHT_DECAY, lr=LEARNING_RATE
+    )
 
     # Save the training parameters including normalization statistics
     params_dict = dict(vars(params))
-    params_dict.update({
-        # Data parameters:  
-        'normalization_mean': float(train_dataset.mean),
-        'normalization_std': float(train_dataset.std),
-        # Training parameters:
-        'loaded_checkpoint_path': params.loaded_checkpoint_path,
-        'loss_function': loss_func.__class__.__name__,  
-        'optimizer': optimizer.__class__.__name__,  
-        'learning_rate': LEARNING_RATE,  
-        'weight_decay': WEIGHT_DECAY,        
-        'train_patch_size': TRAIN_PATCH_SIZE,
-        'nb_patch_per_epoch': NB_PATCH_PER_EPOCH,
-        'nb_train_epoch': params.nb_train_epoch,
-        'training_cuda_device': params.cuda_device,
-        'training_batch_size': params.batch_size,
-        'training_mixed_precision': use_amp,
-        'training_crop': train_dataset.crop,
-        'training_circle_mask': train_dataset.circle_mask,
-        # Image-level residual learning: the trained model computes
-        # output = input + unet(input). Recorded in params.json so any
-        # downstream tooling that needs to reason about checkpoint type
-        # can detect it without inspecting state_dict keys.
-        'residual_learning': True,
-        # UNet model architecture parameters (read from the inner unet,
-        # which is wrapped by ResidualUNet on this branch).
-        'unet_in_channels': model.unet.in_channels,
-        'unet_out_channels': model.unet.out_channels,
-        'unet_channels': model.unet.channels,
-        'unet_strides': model.unet.strides,
-        'unet_kernel_size': model.unet.kernel_size,
-        'unet_up_kernel_size': model.unet.up_kernel_size,
-        'unet_num_res_units': model.unet.num_res_units,
-        'unet_act': model.unet.act,
-        'unet_norm': model.unet.norm,
-        'unet_dropout': model.unet.dropout,
-    })
-    with open(checkpoint_dir / "params.json", 'w') as par_file:
+    params_dict.update(
+        {
+            # Data parameters:
+            "normalization_mean": float(train_dataset.mean),
+            "normalization_std": float(train_dataset.std),
+            # Training parameters:
+            "loaded_checkpoint_path": params.loaded_checkpoint_path,
+            "loss_function": loss_func.__class__.__name__,
+            "optimizer": optimizer.__class__.__name__,
+            "learning_rate": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "train_patch_size": TRAIN_PATCH_SIZE,
+            "nb_patch_per_epoch": NB_PATCH_PER_EPOCH,
+            "nb_train_epoch": params.nb_train_epoch,
+            "training_cuda_device": params.cuda_device,
+            "training_batch_size": params.batch_size,
+            "training_mixed_precision": use_amp,
+            "training_crop": train_dataset.crop,
+            "training_circle_mask": train_dataset.circle_mask,
+            # Image-level residual learning: the trained model computes
+            # output = input + unet(input). Recorded in params.json so any
+            # downstream tooling that needs to reason about checkpoint type
+            # can detect it without inspecting state_dict keys.
+            "residual_learning": True,
+            # UNet model architecture parameters (read from the inner unet,
+            # which is wrapped by ResidualUNet on this branch).
+            "unet_in_channels": model.unet.in_channels,
+            "unet_out_channels": model.unet.out_channels,
+            "unet_channels": model.unet.channels,
+            "unet_strides": model.unet.strides,
+            "unet_kernel_size": model.unet.kernel_size,
+            "unet_up_kernel_size": model.unet.up_kernel_size,
+            "unet_num_res_units": model.unet.num_res_units,
+            "unet_act": model.unet.act,
+            "unet_norm": model.unet.norm,
+            "unet_dropout": model.unet.dropout,
+        }
+    )
+    with open(checkpoint_dir / "params.json", "w") as par_file:
         json.dump(params_dict, par_file)
-    logging.info(f"Saved training parameters with normalization statistics: mean={train_dataset.mean:.6f}, std={train_dataset.std:.6f}")
+    logging.info(
+        f"Saved training parameters with normalization statistics: mean={train_dataset.mean:.6f}, std={train_dataset.std:.6f}"
+    )
 
     # Apply the already-resolved torch.compile decision (use_compile was set and
     # logged in the device/precision block above). The wrap is done here, after
@@ -920,7 +959,9 @@ def main(params):
         try:
             model = torch.compile(model)
         except Exception as e:
-            logging.warning(f"    torch.compile failed at wrap time; using eager mode: {e}")
+            logging.warning(
+                f"    torch.compile failed at wrap time; using eager mode: {e}"
+            )
 
     # Train model
     stats = train_model(
@@ -952,20 +993,74 @@ def main(params):
 
 if __name__ == "__main__":
 
-    parse = ArgumentParser(description="Train a model with Noise2Inverse, using 3d convolutions")
-    parse.add_argument('input_json', help='Path to JSON file containing dataset information and processing paths')
-    parse.add_argument('--loaded_checkpoint_path', default=None, help="If set, load the checkpoint located at the provided path")
-    parse.add_argument('--nb_train_epoch', default=50, type=int, help="The number of training epochs")
-    parse.add_argument('--batch_size', default=16, type=int, help="The number of patch per batch")
-    parse.add_argument('--cuda_device', default='auto', type=_cuda_device_arg, help="CUDA device to use: a non-negative integer or 'auto' (picks the GPU with the most free memory via nvidia-smi). Default: auto.")
-    parse.add_argument('--num_res_units', default=0, type=int, help="Number of residual conv units per level inside the MONAI U-Net (default: 0, a plain conv block per level). This is MONAI's intra-block residual learning, distinct from the image-level residual wrapper. Values of 1 or 2 add deeper per-level blocks with internal skip connections, which can improve denoising fidelity / edge sharpness at the cost of more compute, memory, and parameters. Recorded in params.json so inference reconstructs the matching architecture.")
-    parse.add_argument('--unet_depth', default=4, type=int, help="Number of U-Net levels (default: 4). Channels start at 56 and double per level, so depth 4 = (56,112,224,448) and depth 3 = (56,112,224); there are unet_depth-1 downsampling stages. Fewer levels keep detail at a finer resolution (less of the smoothing caused by the coarse bottleneck) but shrink the receptive field; more levels widen context at the cost of more downsampling. Must be >= 2. Recorded in params.json so inference reconstructs the matching architecture.")
-    parse.add_argument('--unet_stride', default=2, type=int, help="Downsampling factor applied uniformly at every U-Net stage (default: 2). Set to 1 for a no-downsampling, full-resolution network: the sharpest option since no spatial information is lost, but dramatically more memory- and compute-hungry. Must be >= 1. Recorded in params.json so inference reconstructs the matching architecture.")
-    parse.add_argument('--norm_division_factor', default=56, type=int, help="Division factor for group normalization. 56 (default) = layer norm (num_groups=1), the best pairing with residual learning; 1 = instance norm (num_groups=56); intermediate divisors of 56 give true group norm. Valid values: 1, 2, 4, 7, 8, 14, 28, 56.")
-    parse.add_argument('--num_workers', default=4, type=int, help="Number of DataLoader worker processes (default: 4; use 0 on very low-RAM systems)")
-    parse.add_argument('--no_half', action='store_true', help="Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0)")
-    parse.add_argument('--compile', action='store_true', help="Enable torch.compile (default: disabled). Gives a ~1.2-1.5x training speedup after a one-time compilation on the first step, but requires PyTorch 2.0+, a GPU with compute capability >= 7.0, and -- on Windows -- an MSVC toolchain + Windows SDK on PATH to build the kernels. Only enable it if your toolchain is set up; otherwise Triton prints repeated 'Failed to find MSVC' warnings and falls back to eager mode.")
-    parse.add_argument('--keep_only_last', action='store_true', help="Keep only the most recent epoch's checkpoint on disk; delete previous ones after each save (default: keep every epoch)")
-    parse.add_argument('--loss', default='mse', choices=('mse', 'l1'), help="Loss function: 'mse' (default, recovers conditional mean) or 'l1' (recovers conditional median for symmetric noise; often produces sharper edges)")
+    parse = ArgumentParser(
+        description="Train a model with Noise2Inverse, using 3d convolutions"
+    )
+    parse.add_argument(
+        "input_json",
+        help="Path to JSON file containing dataset information and processing paths",
+    )
+    parse.add_argument(
+        "--loaded_checkpoint_path",
+        default=None,
+        help="If set, load the checkpoint located at the provided path",
+    )
+    parse.add_argument(
+        "--nb_train_epoch", default=50, type=int, help="The number of training epochs"
+    )
+    parse.add_argument(
+        "--batch_size", default=16, type=int, help="The number of patch per batch"
+    )
+    parse.add_argument(
+        "--cuda_device",
+        default="auto",
+        type=_cuda_device_arg,
+        help="CUDA device to use: a non-negative integer or 'auto' (picks the GPU with the most free memory via nvidia-smi). Default: auto.",
+    )
+    parse.add_argument(
+        "--num_res_units",
+        default=0,
+        type=int,
+        help="Number of residual conv units per level inside the MONAI U-Net (default: 0, a plain conv block per level). This is MONAI's intra-block residual learning, distinct from the image-level residual wrapper. Values of 1 or 2 add deeper per-level blocks with internal skip connections, which can improve denoising fidelity / edge sharpness at the cost of more compute, memory, and parameters. Recorded in params.json so inference reconstructs the matching architecture.",
+    )
+    parse.add_argument(
+        "--unet_depth",
+        default=4,
+        type=int,
+        help="Number of U-Net levels (default: 4). Channels start at 56 and double per level, so depth 4 = (56,112,224,448) and depth 3 = (56,112,224); there are unet_depth-1 downsampling stages. Fewer levels keep detail at a finer resolution (less of the smoothing caused by the coarse bottleneck) but shrink the receptive field; more levels widen context at the cost of more downsampling. Must be >= 2. Recorded in params.json so inference reconstructs the matching architecture.",
+    )
+    parse.add_argument(
+        "--unet_stride",
+        default=2,
+        type=int,
+        help="Downsampling factor applied uniformly at every U-Net stage (default: 2). Set to 1 for a no-downsampling, full-resolution network: the sharpest option since no spatial information is lost, but dramatically more memory- and compute-hungry. Must be >= 1. Recorded in params.json so inference reconstructs the matching architecture.",
+    )
+    parse.add_argument(
+        "--norm_division_factor",
+        default=56,
+        type=int,
+        help="Division factor for group normalization. 56 (default) = layer norm (num_groups=1), the best pairing with residual learning; 1 = instance norm (num_groups=56); intermediate divisors of 56 give true group norm. Valid values: 1, 2, 4, 7, 8, 14, 28, 56.",
+    )
+    parse.add_argument(
+        "--num_workers",
+        default=4,
+        type=int,
+        help="Number of DataLoader worker processes (default: 4; use 0 on very low-RAM systems)",
+    )
+    parse.add_argument(
+        "--no_half",
+        action="store_true",
+        help="Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0)",
+    )
+    parse.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable torch.compile (default: disabled). Gives a ~1.2-1.5x training speedup after a one-time compilation on the first step, but requires PyTorch 2.0+, a GPU with compute capability >= 7.0, and -- on Windows -- an MSVC toolchain + Windows SDK on PATH to build the kernels. Only enable it if your toolchain is set up; otherwise Triton prints repeated 'Failed to find MSVC' warnings and falls back to eager mode.",
+    )
+    parse.add_argument(
+        "--keep_only_last",
+        action="store_true",
+        help="Keep only the most recent epoch's checkpoint on disk; delete previous ones after each save (default: keep every epoch)",
+    )
 
     main(parse.parse_args())
