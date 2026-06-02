@@ -683,11 +683,14 @@ def main(args) -> None:
                 )
             logging.info(f"    Mixed precision (fp16): disabled ({reason})")
 
-        # torch.compile: needs PyTorch 2.0+ + CUDA + compute capability >= 7.0.
-        # Triton (the inductor backend) refuses to compile for compute < 7.0.
-        if args.no_compile:
+        # torch.compile is opt-in (--compile). It needs PyTorch 2.0+ + CUDA +
+        # compute capability >= 7.0 (Triton, the inductor backend, refuses to
+        # compile for compute < 7.0) and, on Windows, an MSVC toolchain +
+        # Windows SDK on PATH. Defaulting it off keeps the common path
+        # warning-free; pass --compile when the toolchain is set up.
+        if not args.compile:
             use_compile = False
-            logging.info("    torch.compile: disabled (--no_compile)")
+            logging.info("    torch.compile: disabled (default; pass --compile to enable)")
         elif not hasattr(torch, "compile"):
             use_compile = False
             logging.info("    torch.compile: disabled (PyTorch < 2.0)")
@@ -699,7 +702,7 @@ def main(args) -> None:
             )
         else:
             use_compile = True
-            logging.info("    torch.compile: enabled (will compile on first inference call)")
+            logging.info("    torch.compile: enabled (--compile; will compile on first inference call)")
 
         # Create model (with architecture from training parameters).
         # The norm_division_factor is read from the checkpoint's params.json
@@ -836,7 +839,7 @@ if __name__ == "__main__":
     parse.add_argument('--overlap', default=0.5, type=float, help='Overlap ratio between patches for sliding window inference')
     parse.add_argument('--no_compression', action='store_true', help='Disable compression in output TIFF files (default: enabled)')
     parse.add_argument('--no_half', action='store_true', help='Disable fp16 mixed precision inference (default: enabled when CUDA is available)')
-    parse.add_argument('--no_compile', action='store_true', help='Disable torch.compile (default: enabled when PyTorch 2.0+ is available; gives ~1.2-1.5x speedup after one-time compilation overhead)')
+    parse.add_argument('--compile', action='store_true', help="Enable torch.compile (default: disabled). Gives a ~1.2-1.5x speedup after a one-time compilation on the first inference call, but requires PyTorch 2.0+, a GPU with compute capability >= 7.0, and -- on Windows -- an MSVC toolchain + Windows SDK on PATH to build the kernels. Only enable it if your toolchain is set up; otherwise Triton prints repeated 'Failed to find MSVC' warnings and falls back to eager mode.")
     parse.add_argument('--no_padding', action='store_true', help='Disable replicate-padding of the test volume by half-patch on each side (default: enabled). Padding ensures every output voxel is predicted from well-conditioned patch-center context; disabling it cuts inference time roughly 1.5-2x at the cost of slightly degraded predictions in the outermost ~half-patch of the volume.')
     parse.add_argument('--gpu_aggregation', action='store_true', help='Keep the sliding-window aggregation buffer on GPU instead of CPU (default: CPU). Faster (eliminates per-patch sync) but costs ~2 * D * H * W * 4 bytes of extra VRAM; safe only on cards with enough headroom for the volume size.')
     
@@ -845,7 +848,6 @@ if __name__ == "__main__":
     # Handle flag logic (default to True, disable if flag is set)
     args.compression = not args.no_compression
     args.half = not args.no_half
-    args.compile = not args.no_compile
     args.padding = not args.no_padding
     
     main(args)

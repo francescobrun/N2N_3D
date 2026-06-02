@@ -803,13 +803,17 @@ def main(params):
             )
         logging.info(f"    Mixed precision (fp16): disabled ({reason})")
 
-    # torch.compile: needs PyTorch 2.0+ + CUDA + compute capability >= 7.0
-    # (Triton, the inductor backend, refuses to compile for compute < 7.0).
-    # The decision and its log line are resolved here; the wrap itself is
-    # applied later (after params.json is written and the optimizer is created).
-    if params.no_compile:
+    # torch.compile is opt-in (--compile). It needs PyTorch 2.0+ + CUDA +
+    # compute capability >= 7.0 (Triton, the inductor backend, refuses to
+    # compile for compute < 7.0) and, on Windows, an MSVC toolchain + Windows
+    # SDK on PATH to build the generated kernels -- which not every machine has.
+    # Defaulting it off keeps the common path warning-free; users who know their
+    # toolchain is set up pass --compile for the ~1.2-1.5x speedup. The decision
+    # and its log line are resolved here; the wrap itself is applied later
+    # (after params.json is written and the optimizer is created).
+    if not params.compile:
         use_compile = False
-        logging.info("    torch.compile: disabled (--no_compile)")
+        logging.info("    torch.compile: disabled (default; pass --compile to enable)")
     elif not hasattr(torch, "compile"):
         use_compile = False
         logging.info("    torch.compile: disabled (PyTorch < 2.0)")
@@ -821,7 +825,7 @@ def main(params):
         )
     else:
         use_compile = True
-        logging.info("    torch.compile: enabled (will compile on first training step)")
+        logging.info("    torch.compile: enabled (--compile; will compile on first training step)")
 
 
     # Initialize the model to be trained
@@ -960,7 +964,7 @@ if __name__ == "__main__":
     parse.add_argument('--norm_division_factor', default=56, type=int, help="Division factor for group normalization. 56 (default) = layer norm (num_groups=1), the best pairing with residual learning; 1 = instance norm (num_groups=56); intermediate divisors of 56 give true group norm. Valid values: 1, 2, 4, 7, 8, 14, 28, 56.")
     parse.add_argument('--num_workers', default=4, type=int, help="Number of DataLoader worker processes (default: 4; use 0 on very low-RAM systems)")
     parse.add_argument('--no_half', action='store_true', help="Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0)")
-    parse.add_argument('--no_compile', action='store_true', help="Disable torch.compile (default: enabled when PyTorch 2.0+ is available and the GPU has compute capability >= 7.0; gives ~1.2-1.5x training speedup after a one-time compilation on the first step)")
+    parse.add_argument('--compile', action='store_true', help="Enable torch.compile (default: disabled). Gives a ~1.2-1.5x training speedup after a one-time compilation on the first step, but requires PyTorch 2.0+, a GPU with compute capability >= 7.0, and -- on Windows -- an MSVC toolchain + Windows SDK on PATH to build the kernels. Only enable it if your toolchain is set up; otherwise Triton prints repeated 'Failed to find MSVC' warnings and falls back to eager mode.")
     parse.add_argument('--keep_only_last', action='store_true', help="Keep only the most recent epoch's checkpoint on disk; delete previous ones after each save (default: keep every epoch)")
     parse.add_argument('--loss', default='mse', choices=('mse', 'l1'), help="Loss function: 'mse' (default, recovers conditional mean) or 'l1' (recovers conditional median for symmetric noise; often produces sharper edges)")
 
