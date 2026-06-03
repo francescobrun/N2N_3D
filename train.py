@@ -95,6 +95,15 @@ NB_PATCH_PER_EPOCH = 17600  # Number of patches per epoch
 LEARNING_RATE = 0.0005  # Learning rate for Adam optimizer
 WEIGHT_DECAY = 0.0  # Weight decay coefficient for L2 regularization
 
+# ReduceLROnPlateau scheduler. The starting lr is untuned, so the lr is halved
+# whenever the per-epoch training loss stops improving for LR_PATIENCE epochs,
+# down to LR_MIN_LR. patience=4 ignores single-epoch noise; factor=0.5 is a
+# gentle halving. Stepping is per-epoch on the mean training loss (the N2N
+# target is an independent noisy split, so that loss tracks real progress).
+LR_SCHED_FACTOR = 0.5  # Multiply lr by this on plateau
+LR_SCHED_PATIENCE = 4  # Epochs without improvement before reducing
+LR_SCHED_MIN_LR = 1e-6  # Floor below which lr is not reduced further
+
 
 # ============================================================================
 # CUSTOM TRANSFORMS AND DATASET CLASSES
@@ -615,7 +624,7 @@ def _select_cuda_device(arg):
         return 0, ""
 
 
-def save_model(model, optimizer, epoch, save_path):
+def save_model(model, optimizer, scheduler, epoch, save_path):
     """Save model checkpoint with PyTorch's built-in compression.
 
     Saves the underlying (uncompiled) module's state_dict so checkpoints are
@@ -628,6 +637,7 @@ def save_model(model, optimizer, epoch, save_path):
         "epoch": int(epoch),
         "state_dict": base_model.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
     }
     # Use PyTorch's compression (recommended)
     torch.save(state, save_path, _use_new_zipfile_serialization=True)
@@ -638,6 +648,7 @@ def train_model(
     model,
     loss_func,
     optimizer,
+    scheduler,
     checkpoint_dir,
     loaded_checkpoint_path,
     nb_train_epoch,
@@ -659,6 +670,12 @@ def train_model(
         # work whether or not the model has been wrapped by torch.compile.
         getattr(model, "_orig_mod", model).load_state_dict(state["state_dict"])
         optimizer.load_state_dict(state["optimizer"])
+        # Restore the scheduler's plateau history (best loss, bad-epoch counter)
+        # so a resumed run continues decaying instead of starting fresh. Older
+        # checkpoints predate this key; falling back to the fresh scheduler is
+        # harmless.
+        if "scheduler" in state:
+            scheduler.load_state_dict(state["scheduler"])
         start_epoch_nb = state["epoch"] + 1
 
     # GradScaler prevents fp16 gradient underflow during backward. When
@@ -725,6 +742,14 @@ def train_model(
         loss_csv.flush()
         final_loss = epoch_loss
 
+        # Step the plateau scheduler on the epoch's mean loss; log only when it
+        # actually reduces the lr so the decay is visible in the training log.
+        lr_before = optimizer.param_groups[0]["lr"]
+        scheduler.step(epoch_loss)
+        lr_after = optimizer.param_groups[0]["lr"]
+        if lr_after < lr_before:
+            logging.info(f"    ReduceLROnPlateau: lr {lr_before:.2e} -> {lr_after:.2e}")
+
         # Show memory monitoring only after first epoch. We deliberately do
         # NOT reset the CUDA peak tracker -- letting it accumulate across all
         # epochs lets the end-of-run summary report the true overall peak.
@@ -742,7 +767,11 @@ def train_model(
         # Save checkpoint at each epoch
         logging.info("Saving checkpoint for epoch n°{}...".format(epoch))
         save_model(
-            model, optimizer, epoch, checkpoint_dir / f"weights_epoch_{epoch:03d}.torch"
+            model,
+            optimizer,
+            scheduler,
+            epoch,
+            checkpoint_dir / f"weights_epoch_{epoch:03d}.torch",
         )
 
         # If keep_only_last is set, delete the previous epoch's checkpoint
@@ -900,6 +929,16 @@ def main(params):
     optimizer = torch.optim.Adam(
         model.parameters(), weight_decay=WEIGHT_DECAY, lr=LEARNING_RATE
     )
+    # Halve the lr when the per-epoch training loss plateaus. The starting lr is
+    # untuned, so let the schedule recover the late-training convergence instead
+    # of hand-tuning a constant. Stepped once per epoch on the mean loss.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=LR_SCHED_FACTOR,
+        patience=LR_SCHED_PATIENCE,
+        min_lr=LR_SCHED_MIN_LR,
+    )
 
     # Save the training parameters including normalization statistics
     params_dict = dict(vars(params))
@@ -914,6 +953,10 @@ def main(params):
             "optimizer": optimizer.__class__.__name__,
             "learning_rate": LEARNING_RATE,
             "weight_decay": WEIGHT_DECAY,
+            "lr_scheduler": scheduler.__class__.__name__,
+            "lr_scheduler_factor": LR_SCHED_FACTOR,
+            "lr_scheduler_patience": LR_SCHED_PATIENCE,
+            "lr_scheduler_min_lr": LR_SCHED_MIN_LR,
             "train_patch_size": TRAIN_PATCH_SIZE,
             "nb_patch_per_epoch": NB_PATCH_PER_EPOCH,
             "nb_train_epoch": params.nb_train_epoch,
@@ -969,6 +1012,7 @@ def main(params):
         model,
         loss_func,
         optimizer,
+        scheduler,
         checkpoint_dir,
         params.loaded_checkpoint_path,
         params.nb_train_epoch,
