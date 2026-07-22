@@ -599,23 +599,39 @@ def train_model(
                 total_loss = loss_func(pred, target)
 
                 # Rotation-equivariance term (--rotation_equivariance, opt-in).
-                # Both input and target are rotated by the same angle and the
-                # network is trained to hit the rotated target on the rotated
-                # input -- R_EQUIVARIANCE_ROTATIONS extra forward passes, added
-                # unweighted to the primary loss (Xu & Perelli, RAN2I, Eq. 17).
+                # Penalizes the network for disagreeing with itself across
+                # orientations: f(rot(x)) should equal rot(f(x)), the property
+                # induced by the CT geometry (rotating the object rotates the
+                # reconstruction identically). Costs R_EQUIVARIANCE_ROTATIONS
+                # extra forward passes, added unweighted to the primary loss.
+                #
+                # Inspired by Xu & Perelli, "Rotational Augmented Noise2Inverse"
+                # (IEEE TRPMS 2023), but deliberately NOT their Eq. 17 as
+                # printed. That term rotates the network output and the target
+                # together, ||Tg f(x) - Tg(target)||^2; for an exactly unitary
+                # Tg -- and rot90 is a permutation, so exactly unitary -- MSE is
+                # invariant under it, making the term bit-identical to the
+                # primary loss and optimizing nothing. Their continuous-angle
+                # rotation escapes this only through interpolation loss. We
+                # enforce the equivariance relation directly instead.
+                #
                 # Restricted to the x-y plane (last two dims; z fixed) since
                 # that's the only axis pair with physical rotational symmetry
                 # for this pipeline's CT-style cylindrical-FOV data.
+                #
+                # No stop-gradient on either side: the degenerate solution (a
+                # constant f is trivially equivariant) is ruled out by the
+                # primary N2N term this is summed with.
                 equiv_loss = torch.zeros((), device=device)
                 if rotation_equivariance:
                     rotation_ks = (
                         torch.randperm(3)[:R_EQUIVARIANCE_ROTATIONS] + 1
                     ).tolist()
                     for k in rotation_ks:
-                        input_k = torch.rot90(input, k, dims=(-2, -1))
-                        target_k = torch.rot90(target, k, dims=(-2, -1))
-                        pred_k = model(input_k)
-                        equiv_loss = equiv_loss + loss_func(pred_k, target_k)
+                        pred_k = model(torch.rot90(input, k, dims=(-2, -1)))
+                        equiv_loss = equiv_loss + loss_func(
+                            pred_k, torch.rot90(pred, k, dims=(-2, -1))
+                        )
 
                 loss_val = (total_loss + equiv_loss) * 1000
 
@@ -960,7 +976,7 @@ if __name__ == "__main__":
     parse.add_argument(
         "--rotation_equivariance",
         action="store_true",
-        help="Add a rotation-equivariance term to the training loss (default: disabled). Inspired by Xu & Perelli, 'Rotational Augmented Noise2Inverse' (IEEE TRPMS 2023): for R_EQUIVARIANCE_ROTATIONS randomly chosen 90-degree in-plane (x-y) rotations per step, both input and target are rotated and the network is trained to hit the rotated target on the rotated input, added unweighted to the primary loss. Restricted to the x-y plane (z held fixed), not full 3D, matching the physically distinguished gantry axis this pipeline already assumes elsewhere (see training_circle_mask). Adds R_EQUIVARIANCE_ROTATIONS extra forward passes per step (~3x total compute at the default of 2) -- experimental, needs empirical validation on real data before adopting as default.",
+        help="Add a rotation-equivariance term to the training loss (default: disabled). Enforces the property induced by the CT geometry -- rotating the object rotates the reconstruction identically -- by penalizing the network when f(rotate(x)) differs from rotate(f(x)), for R_EQUIVARIANCE_ROTATIONS randomly chosen 90-degree in-plane (x-y) rotations per step, added unweighted to the primary loss. Inspired by Xu & Perelli, 'Rotational Augmented Noise2Inverse' (IEEE TRPMS 2023), but not their Eq. 17 as printed: that form rotates the output and target together, which for an exactly unitary transform (a 90-degree rotation is a permutation) is identical to the primary loss and optimizes nothing. Restricted to the x-y plane (z held fixed), not full 3D, matching the physically distinguished gantry axis this pipeline already assumes elsewhere (see training_circle_mask). Adds R_EQUIVARIANCE_ROTATIONS extra forward passes per step (~3x total compute at the default of 2) -- experimental, needs empirical validation on real data before adopting as default.",
     )
     parse.add_argument(
         "--num_workers",
