@@ -1,5 +1,311 @@
+"""Model definition plus the environment setup shared by train.py and inference.py.
+
+Everything below the model factory is infrastructure that both entry points
+need identically: backend flags, logging format, z-score normalization, the
+AMP / torch.load version shims, CUDA device selection, and the
+capability-gated fp16 / torch.compile decisions. Keeping a single copy here
+means the two scripts cannot drift apart -- previously each maintained its own
+copy and the normalization epsilon had already diverged between them.
+"""
+
 from monai.networks.nets import UNet
 import torch
+import logging
+import inspect as _inspect
+
+
+# ============================================================================
+# BACKEND CONFIGURATION
+# ============================================================================
+
+# Enable cuDNN autotuning and TF32. Training and inference both run fixed-shape
+# convolutions (96^3 patches / fixed sliding-window roi), so cuDNN's benchmark
+# mode pays its one-time autotune cost back immediately by selecting the fastest
+# conv algorithm. TF32 (Ampere+; a no-op on older cards) speeds up the fp32
+# fallback paths with precision that is irrelevant for denoising.
+#
+# Set at import time: both entry points import this module before doing any
+# CUDA work, so the flags apply exactly as early as they did when each script
+# set them itself.
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
+# ============================================================================
+# NORMALIZATION
+# ============================================================================
+
+# Guards against division by zero on a (near-)constant volume. Training and
+# inference must use the identical expression or the network sees a different
+# input distribution at inference than it was trained on.
+NORM_EPS = 1e-7
+
+
+def zscore_normalize(x, mean, std):
+    """Z-score normalize an array or tensor. Shared by training and inference."""
+    return (x - mean) / (std + NORM_EPS)
+
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+
+
+def setup_logging() -> None:
+    """Configure timestamped logging.
+
+    Training and inference share one format so a back-to-back train/infer
+    session produces output that can be cross-correlated by wall clock.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+# ============================================================================
+# VERSION COMPATIBILITY SHIMS
+# ============================================================================
+
+# AMP API compatibility: PyTorch 2.0+ exposes torch.amp.GradScaler / torch.autocast
+# (device-agnostic), while older PyTorch (~1.6 to ~1.13) exposes torch.cuda.amp.*.
+# Both implementations are functionally equivalent for our usage; we pick whichever
+# the installed version provides so the pipeline runs on older toolchains too.
+if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+
+    def _make_gradscaler(enabled):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+
+else:
+
+    def _make_gradscaler(enabled):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+if hasattr(torch, "autocast"):
+
+    def _amp_autocast(enabled):
+        return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=enabled)
+
+else:
+
+    def _amp_autocast(enabled):
+        return torch.cuda.amp.autocast(enabled=enabled)
+
+
+# torch.load gained a `weights_only` keyword in PyTorch 1.13 (and the default
+# flipped to True in 2.6 with a FutureWarning otherwise). On older PyTorch the
+# argument doesn't exist and passing it raises TypeError. Detect once and call
+# torch.load with or without the kwarg accordingly.
+_TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = (
+    "weights_only" in _inspect.signature(torch.load).parameters
+)
+
+
+def _safe_torch_load(path, map_location):
+    if _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    return torch.load(path, map_location=map_location)
+
+
+# ============================================================================
+# DEVICE SELECTION
+# ============================================================================
+
+
+def _cuda_device_arg(s):
+    """argparse type for --cuda_device: accepts 'auto' or a non-negative int."""
+    if s == "auto":
+        return s
+    try:
+        value = int(s)
+    except ValueError:
+        import argparse
+
+        raise argparse.ArgumentTypeError(
+            f"--cuda_device must be 'auto' or an integer, got {s!r}"
+        )
+    if value < 0:
+        import argparse
+
+        raise argparse.ArgumentTypeError(f"--cuda_device must be >= 0, got {value}")
+    return value
+
+
+def _select_cuda_device(arg):
+    """Resolve --cuda_device to a concrete GPU index.
+
+    Returns a tuple (index, info_string). For an explicit integer the info
+    string is empty. For successful 'auto' selection the info string
+    summarizes the choice so the caller can fold it into a single log line.
+    Warnings are logged directly here and the index falls back to 0.
+
+    Free memory is queried via torch.cuda.mem_get_info when available
+    (PyTorch 1.11+), which respects CUDA_VISIBLE_DEVICES and only reports
+    GPUs PyTorch can actually use. We fall back to nvidia-smi only when
+    that API is missing, and refuse to trust nvidia-smi if its device
+    count disagrees with what PyTorch sees -- because nvidia-smi reports
+    physical GPUs, not the subset visible to PyTorch.
+    """
+    if isinstance(arg, int):
+        return arg, ""
+    if arg != "auto":
+        return int(arg), ""
+
+    if not torch.cuda.is_available():
+        return 0, ""
+
+    n_visible = torch.cuda.device_count()
+    if n_visible == 0:
+        return 0, ""
+
+    # Preferred path: PyTorch's own per-device free-memory query.
+    try:
+        free = []
+        for i in range(n_visible):
+            free_bytes, _ = torch.cuda.mem_get_info(i)
+            free.append(free_bytes // (1024**2))
+        idx = max(range(len(free)), key=lambda i: free[i])
+        return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
+    except AttributeError:
+        pass  # PyTorch < 1.11: mem_get_info not available, fall through
+
+    # Fallback: nvidia-smi. Only trust it if its device count matches
+    # PyTorch's view; otherwise CUDA_VISIBLE_DEVICES (or similar) is
+    # restricting PyTorch and the indices would be mis-mapped.
+    try:
+        import subprocess
+
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            text=True,
+        )
+        free = [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
+        if len(free) != n_visible:
+            logging.warning(
+                f"    --cuda_device auto: nvidia-smi reports {len(free)} GPUs but "
+                f"PyTorch sees {n_visible} (likely CUDA_VISIBLE_DEVICES is set); "
+                f"falling back to cuda:0 for safety."
+            )
+            return 0, ""
+        idx = max(range(len(free)), key=lambda i: free[i])
+        return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
+    except (subprocess.SubprocessError, FileNotFoundError, ValueError) as e:
+        logging.warning(
+            f"    --cuda_device auto: nvidia-smi failed ({e}); falling back to 0"
+        )
+        return 0, ""
+
+
+def resolve_device(cuda_device_arg):
+    """Resolve --cuda_device into a concrete device and log the choice.
+
+    Returns (device, index, compute_major, compute_minor). ``device`` is the
+    torch.device every tensor in the run must be placed on -- callers should
+    use it rather than bare ``.cuda()``, which ignores the selected index and
+    would strand tensors on cuda:0 whenever 'auto' picks a different GPU.
+    """
+    index, info = _select_cuda_device(cuda_device_arg)
+
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{index}")
+        msg = f"    Using GPU device: cuda:{index}"
+        if info:
+            msg += f" ({info})"
+        logging.info(msg)
+        compute_major, compute_minor = torch.cuda.get_device_capability(device)
+    else:
+        device = torch.device("cpu")
+        index = 0
+        logging.info("    CUDA not available, using CPU")
+        compute_major, compute_minor = 0, 0
+
+    return device, index, compute_major, compute_minor
+
+
+# ============================================================================
+# CAPABILITY-GATED ACCELERATION
+# ============================================================================
+
+
+def resolve_mixed_precision(want_half, device, compute_major, compute_minor):
+    """Decide whether fp16 autocast is used, and log why.
+
+    fp16 mixed precision requires CUDA and a tensor-core-capable GPU (compute
+    capability >= 7.0: Volta/Turing/Ampere/Ada/Hopper). On older cards (e.g.
+    Pascal GTX 10-series) fp16 throughput is much lower than fp32, so autocast
+    would slow the run down rather than speed it up.
+    """
+    if want_half and device.type == "cuda" and compute_major >= 7:
+        logging.info(
+            f"    Mixed precision (fp16): enabled "
+            f"(compute capability {compute_major}.{compute_minor})"
+        )
+        return True
+
+    if not want_half:
+        reason = "--no_half"
+    elif device.type != "cuda":
+        reason = "CPU"
+    else:
+        reason = (
+            f"compute capability {compute_major}.{compute_minor} lacks "
+            f"tensor cores; fp16 would run slower than fp32"
+        )
+    logging.info(f"    Mixed precision (fp16): disabled ({reason})")
+    return False
+
+
+def resolve_compile(want_compile, device, compute_major, first_call_desc):
+    """Decide whether torch.compile is used, and log why.
+
+    torch.compile is opt-in (--compile). It needs PyTorch 2.0+ + CUDA +
+    compute capability >= 7.0 (Triton, the inductor backend, refuses to compile
+    for compute < 7.0) and, on Windows, an MSVC toolchain + Windows SDK on PATH
+    to build the generated kernels -- which not every machine has. Defaulting it
+    off keeps the common path warning-free.
+
+    ``first_call_desc`` describes when compilation happens (e.g. "first
+    training step") so the log line is accurate for either entry point.
+    """
+    if not want_compile:
+        logging.info("    torch.compile: disabled (default; pass --compile to enable)")
+        return False
+    if not hasattr(torch, "compile"):
+        logging.info("    torch.compile: disabled (PyTorch < 2.0)")
+        return False
+    if device.type != "cuda" or compute_major < 7:
+        logging.info(
+            f"    torch.compile: disabled "
+            f"(compute capability {compute_major}.x lacks Triton backend support; requires >= 7.0)"
+        )
+        return False
+    logging.info(
+        f"    torch.compile: enabled (--compile; will compile on {first_call_desc})"
+    )
+    return True
+
+
+def maybe_compile(model, use_compile):
+    """Wrap the model with torch.compile, falling back to eager mode on error.
+
+    The wrap can still raise on edge cases unrelated to compute capability
+    (missing toolchain, unsupported backend), which must not abort the run.
+    """
+    if not use_compile:
+        return model
+    try:
+        return torch.compile(model)
+    except Exception as e:
+        logging.warning(f"    torch.compile failed at wrap time; using eager mode: {e}")
+        return model
+
+
+# ============================================================================
+# MODEL
+# ============================================================================
 
 
 class ResidualUNet(torch.nn.Module):

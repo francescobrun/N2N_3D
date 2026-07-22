@@ -12,75 +12,19 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 from torch.utils.data import Dataset, DataLoader
 
-from _model import create_model
-
-
-# Enable cuDNN autotuning and TF32. Training and inference both run fixed-shape
-# convolutions (96^3 patches / fixed sliding-window roi), so cuDNN's benchmark
-# mode pays its one-time autotune cost back immediately by selecting the fastest
-# conv algorithm. TF32 (Ampere+; a no-op on older cards) speeds up the fp32
-# fallback paths with precision that is irrelevant for denoising.
-torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-
-# AMP API compatibility: PyTorch 2.0+ exposes torch.amp.GradScaler / torch.autocast
-# (device-agnostic), while older PyTorch (~1.6 to ~1.13) exposes torch.cuda.amp.*.
-# Both implementations are functionally equivalent for our usage; we pick whichever
-# the installed version provides so the pipeline runs on older toolchains too.
-if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-
-    def _make_gradscaler(enabled):
-        return torch.amp.GradScaler("cuda", enabled=enabled)
-
-else:
-
-    def _make_gradscaler(enabled):
-        return torch.cuda.amp.GradScaler(enabled=enabled)
-
-
-if hasattr(torch, "autocast"):
-
-    def _amp_autocast(enabled):
-        return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=enabled)
-
-else:
-
-    def _amp_autocast(enabled):
-        return torch.cuda.amp.autocast(enabled=enabled)
-
-
-# torch.load gained a `weights_only` keyword in PyTorch 1.13 (and the default
-# flipped to True in 2.6 with a FutureWarning otherwise). On older PyTorch the
-# argument doesn't exist and passing it raises TypeError. Detect once and call
-# torch.load with or without the kwarg accordingly.
-import inspect as _inspect
-
-_TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = (
-    "weights_only" in _inspect.signature(torch.load).parameters
+from _model import (
+    create_model,
+    setup_logging,
+    zscore_normalize,
+    maybe_compile,
+    resolve_compile,
+    resolve_device,
+    resolve_mixed_precision,
+    _amp_autocast,
+    _cuda_device_arg,
+    _make_gradscaler,
+    _safe_torch_load,
 )
-del _inspect
-
-
-def _safe_torch_load(path, map_location):
-    if _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY:
-        return torch.load(path, map_location=map_location, weights_only=True)
-    return torch.load(path, map_location=map_location)
-
-
-def setup_logging() -> None:
-    """Configure logging settings for the training script.
-
-    Mirrors the format used by inference.py so a back-to-back train/infer
-    session has consistent timestamped output that can be cross-correlated
-    by wall clock.
-    """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
 
 
 # ============================================================================
@@ -514,8 +458,8 @@ class N2IDataset(Dataset):
 
         # Apply normalization if needed
         if self.normalization:
-            patch1 = (patch1 - self.mean) / (self.std + 1e-7)
-            patch2 = (patch2 - self.mean) / (self.std + 1e-7)
+            patch1 = zscore_normalize(patch1, self.mean, self.std)
+            patch2 = zscore_normalize(patch2, self.mean, self.std)
 
         # Apply cube symmetry transform (same random orientation to both
         # patches so the noisy pair stays registered). Returns plain tensors;
@@ -538,90 +482,6 @@ def _worker_init_fn(worker_id):
     that to numpy.
     """
     np.random.seed(torch.initial_seed() % 2**32)
-
-
-def _cuda_device_arg(s):
-    """argparse type for --cuda_device: accepts 'auto' or a non-negative int."""
-    if s == "auto":
-        return s
-    try:
-        value = int(s)
-    except ValueError:
-        import argparse
-
-        raise argparse.ArgumentTypeError(
-            f"--cuda_device must be 'auto' or an integer, got {s!r}"
-        )
-    if value < 0:
-        import argparse
-
-        raise argparse.ArgumentTypeError(f"--cuda_device must be >= 0, got {value}")
-    return value
-
-
-def _select_cuda_device(arg):
-    """Resolve --cuda_device to a concrete GPU index.
-
-    Returns a tuple (index, info_string). For an explicit integer the info
-    string is empty. For successful 'auto' selection the info string
-    summarizes the choice so the caller can fold it into a single line.
-    Warnings are printed directly here and the index falls back to 0.
-
-    Free memory is queried via torch.cuda.mem_get_info when available
-    (PyTorch 1.11+), which respects CUDA_VISIBLE_DEVICES and only reports
-    GPUs PyTorch can actually use. We fall back to nvidia-smi only when
-    that API is missing, and refuse to trust nvidia-smi if its device
-    count disagrees with what PyTorch sees -- because nvidia-smi reports
-    physical GPUs, not the subset visible to PyTorch.
-    """
-    if isinstance(arg, int):
-        return arg, ""
-    if arg != "auto":
-        return int(arg), ""
-
-    if not torch.cuda.is_available():
-        return 0, ""
-
-    n_visible = torch.cuda.device_count()
-    if n_visible == 0:
-        return 0, ""
-
-    # Preferred path: PyTorch's own per-device free-memory query.
-    try:
-        free = []
-        for i in range(n_visible):
-            free_bytes, _ = torch.cuda.mem_get_info(i)
-            free.append(free_bytes // (1024**2))
-        idx = max(range(len(free)), key=lambda i: free[i])
-        return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
-    except AttributeError:
-        pass  # PyTorch < 1.11: mem_get_info not available, fall through
-
-    # Fallback: nvidia-smi. Only trust it if its device count matches
-    # PyTorch's view; otherwise CUDA_VISIBLE_DEVICES (or similar) is
-    # restricting PyTorch and the indices would be mis-mapped.
-    try:
-        import subprocess
-
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-            text=True,
-        )
-        free = [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
-        if len(free) != n_visible:
-            logging.warning(
-                f"    --cuda_device auto: nvidia-smi reports {len(free)} GPUs but "
-                f"PyTorch sees {n_visible} (likely CUDA_VISIBLE_DEVICES is set); "
-                f"falling back to cuda:0 for safety."
-            )
-            return 0, ""
-        idx = max(range(len(free)), key=lambda i: free[i])
-        return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
-    except (subprocess.SubprocessError, FileNotFoundError, ValueError) as e:
-        logging.warning(
-            f"    --cuda_device auto: nvidia-smi failed ({e}); falling back to 0"
-        )
-        return 0, ""
 
 
 def save_model(model, optimizer, scheduler, epoch, save_path):
@@ -754,8 +614,16 @@ def train_model(
         # NOT reset the CUDA peak tracker -- letting it accumulate across all
         # epochs lets the end-of-run summary report the true overall peak.
         if not first_epoch_completed and torch.cuda.is_available():
-            max_memory_allocated = torch.cuda.max_memory_allocated() / 1024**3
-            logging.info(f"GPU memory peak: {max_memory_allocated:.2f} GB")
+            # Report reserved (allocator-level) memory as the headline figure:
+            # that is what nvidia-smi shows and what determines whether the run
+            # fits on a given card. Allocated (live tensors only) is shown
+            # alongside it because the gap indicates allocator fragmentation.
+            reserved_gb = torch.cuda.max_memory_reserved() / 1024**3
+            allocated_gb = torch.cuda.max_memory_allocated() / 1024**3
+            logging.info(
+                f"GPU memory peak: {reserved_gb:.2f} GB reserved "
+                f"({allocated_gb:.2f} GB allocated)"
+            )
 
         if not first_epoch_completed:
             process = psutil.Process()
@@ -793,7 +661,7 @@ def train_model(
     # at startup, no growing structures during training).
     peak_vram_gb = 0.0
     if torch.cuda.is_available():
-        peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
+        peak_vram_gb = torch.cuda.max_memory_reserved() / 1024**3
     peak_ram_gb = psutil.Process().memory_info().rss / 1024**3
     return {
         "final_loss": final_loss,
@@ -823,82 +691,31 @@ def main(params):
     checkpoint_dir = Path(dataset_info["checkpoint_path"])
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
 
-    # Resolve --cuda_device ('auto' picks the GPU with the most free memory).
-    # After this, params.cuda_device is always a concrete int.
-    params.cuda_device, cuda_info = _select_cuda_device(params.cuda_device)
-
     # Determine device + resolve every GPU-capability-gated decision (fp16,
     # torch.compile) in one block so adjacent log lines tell the user exactly
     # what's actually enabled on this hardware. Mirrors inference.py's layout.
+    # After this, params.cuda_device is always a concrete int.
     logging.info("Configuring device and precision...")
-    if torch.cuda.is_available():
-        device = torch.device(f"cuda:{params.cuda_device}")
-        msg = f"    Using GPU device: cuda:{params.cuda_device}"
-        if cuda_info:
-            msg += f" ({cuda_info})"
-        logging.info(msg)
-        compute_major, compute_minor = torch.cuda.get_device_capability(device)
-    else:
-        device = torch.device("cpu")
-        logging.info("    CUDA not available, using CPU")
-        compute_major, compute_minor = 0, 0
-
-    # fp16 mixed-precision training requires CUDA and a tensor-core-capable
-    # GPU (compute capability >= 7.0: Volta/Turing/Ampere/Ada/Hopper). On
-    # older cards (e.g. Pascal GTX 10-series) fp16 throughput is much lower
-    # than fp32, so autocast would slow training down.
-    use_amp = False
-    if not params.no_half and device.type == "cuda" and compute_major >= 7:
-        use_amp = True
-        logging.info(
-            f"    Mixed precision (fp16): enabled "
-            f"(compute capability {compute_major}.{compute_minor})"
-        )
-    else:
-        if params.no_half:
-            reason = "--no_half"
-        elif device.type != "cuda":
-            reason = "CPU"
-        else:
-            reason = (
-                f"compute capability {compute_major}.{compute_minor} lacks "
-                f"tensor cores; fp16 would run slower than fp32"
-            )
-        logging.info(f"    Mixed precision (fp16): disabled ({reason})")
-
-    # torch.compile is opt-in (--compile). It needs PyTorch 2.0+ + CUDA +
-    # compute capability >= 7.0 (Triton, the inductor backend, refuses to
-    # compile for compute < 7.0) and, on Windows, an MSVC toolchain + Windows
-    # SDK on PATH to build the generated kernels -- which not every machine has.
-    # Defaulting it off keeps the common path warning-free; users who know their
-    # toolchain is set up pass --compile for the ~1.2-1.5x speedup. The decision
-    # and its log line are resolved here; the wrap itself is applied later
-    # (after params.json is written and the optimizer is created).
-    if not params.compile:
-        use_compile = False
-        logging.info("    torch.compile: disabled (default; pass --compile to enable)")
-    elif not hasattr(torch, "compile"):
-        use_compile = False
-        logging.info("    torch.compile: disabled (PyTorch < 2.0)")
-    elif device.type != "cuda" or compute_major < 7:
-        use_compile = False
-        logging.info(
-            f"    torch.compile: disabled "
-            f"(compute capability {compute_major}.x lacks Triton backend support; requires >= 7.0)"
-        )
-    else:
-        use_compile = True
-        logging.info(
-            "    torch.compile: enabled (--compile; will compile on first training step)"
-        )
+    device, params.cuda_device, compute_major, compute_minor = resolve_device(
+        params.cuda_device
+    )
+    use_amp = resolve_mixed_precision(
+        not params.no_half, device, compute_major, compute_minor
+    )
+    # The torch.compile decision and its log line are resolved here; the wrap
+    # itself is applied later (after params.json is written and the optimizer
+    # is created).
+    use_compile = resolve_compile(
+        params.compile, device, compute_major, "first training step"
+    )
 
     # Initialize the model to be trained
     model = create_model(
         device=params.cuda_device if torch.cuda.is_available() else "cpu",
-        norm_division_factor=getattr(params, "norm_division_factor", 1),
-        num_res_units=getattr(params, "num_res_units", 0),
-        unet_depth=getattr(params, "unet_depth", 4),
-        unet_stride=getattr(params, "unet_stride", 2),
+        norm_division_factor=params.norm_division_factor,
+        num_res_units=params.num_res_units,
+        unet_depth=params.unet_depth,
+        unet_stride=params.unet_stride,
     )
 
     # Create the memory-efficient data loading pipeline
@@ -997,14 +814,8 @@ def main(params):
     # optimizer keeps updating the right weights). Training uses a fixed 96^3
     # patch shape, so the model compiles once on the first step with no later
     # recompiles. Checkpoints stay compile-agnostic because save_model unwraps
-    # _orig_mod. The wrap can still raise on edge cases; fall back to eager mode.
-    if use_compile:
-        try:
-            model = torch.compile(model)
-        except Exception as e:
-            logging.warning(
-                f"    torch.compile failed at wrap time; using eager mode: {e}"
-            )
+    # _orig_mod.
+    model = maybe_compile(model, use_compile)
 
     # Train model
     stats = train_model(

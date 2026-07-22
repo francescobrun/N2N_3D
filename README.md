@@ -150,8 +150,9 @@ python inference.py path/to/your/config.json
 
 - `--batch_size`: Number of patches processed simultaneously (default: 4)
 - `--cuda_device`: CUDA device to use. A non-negative integer selects that specific GPU; the string `auto` (default) picks the GPU with the most free memory via `nvidia-smi`. Useful on shared multi-GPU machines to avoid colliding with other users. Falls back to GPU 0 if `nvidia-smi` is unavailable.
-- `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.5). Higher values reduce patch-boundary seams but increase runtime sharply (patch count scales ~`1/(1-overlap)³`); lower values are faster with slightly more risk of visible seams.
+- `--overlap`: Overlap ratio between patches for sliding window inference (default: 0.5). Higher values reduce patch-boundary seams but increase runtime sharply — patch count scales ~`1/(1-overlap)³`, so 0.85 costs roughly **8x** more than 0.5. Gaussian-weighted blending suppresses seams well at the default, but on data with strong low-frequency structure they can still appear; **if you see a patch grid in the output, raise this value** (0.7 and 0.85 are the usual next steps).
 - `--no_compression`: Disable compression in output TIFF files (default: enabled)
+- `--output_float32`: Write the output as float32 instead of restoring the input volume's dtype (default: restore). By default a `uint16` input produces a `uint16` output — values are clipped to the type's range and rounded, so downstream tools receive the same format they supplied and the file is roughly half the size. Pass this flag when the denoised volume feeds further numerical processing and you don't want it quantized back to the source bit depth.
 - `--no_half`: Disable fp16 mixed precision inference (default: enabled on tensor-core GPUs only). fp16 is automatically skipped on older GPUs without tensor cores (compute capability < 7.0, e.g. GTX 10-series / Pascal), where fp16 would be slower than fp32.
 - `--compile`: Enable `torch.compile` (default: **disabled**). When enabled, the model is graph-compiled before inference for ~1.2-1.5x speedup; the first inference call is slower (typically 30-90s) while compilation runs. Requires PyTorch 2.0+, a GPU with compute capability >= 7.0, and — on Windows — an MSVC toolchain + Windows SDK on `PATH` so Triton can build the generated kernels. **Only enable it if your toolchain is set up**; otherwise Triton prints repeated `Failed to find MSVC` warnings and falls back to eager mode. Still gated on the prerequisites above, so it stays off on Pascal and earlier (compute < 7.0) or PyTorch < 2.0 even when passed.
 - `--gpu_aggregation`: Keep the sliding-window aggregation buffer on GPU instead of CPU (default: CPU). Faster inference (~1.2-1.5x by eliminating the per-patch GPU→CPU sync) but uses roughly `2 * D * H * W * 4` bytes of additional VRAM. Recommended only on cards with ample free VRAM after the model and input volume are loaded.
@@ -176,7 +177,8 @@ python inference.py config.json --no_compression
 ```
 
 ### Input/Output Formats
-- **Multi-layer TIFF**: Single file with all slices (default)
+- **Multi-layer TIFF**: Single file with all slices. `output_file` must end in `.tif` or `.tiff` — any other extension is rejected with an error rather than silently reinterpreted.
+- **Dtype**: the output is written back in the input volume's dtype (e.g. `uint16` in → `uint16` out), clipped and rounded to that type's range. Use `--output_float32` to keep the raw float prediction instead.
 - **Metadata**: Complete processing parameters embedded in TIFF tags
 
 ## 📊 Performance Tips

@@ -11,7 +11,19 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 # Import custom modules and external dependencies
-from _model import create_model  # Model creation from model.py
+from _model import (
+    create_model,
+    setup_logging,
+    zscore_normalize,
+    NORM_EPS,
+    maybe_compile,
+    resolve_compile,
+    resolve_device,
+    resolve_mixed_precision,
+    _amp_autocast,
+    _cuda_device_arg,
+    _safe_torch_load,
+)
 from monai.inferers import sliding_window_inference  # MONAI's sliding window inference
 from tqdm import tqdm  # Progress bar utility
 
@@ -22,163 +34,34 @@ warnings.filterwarnings(
     message="Using a non-tuple sequence for multidimensional indexing is deprecated",
 )
 
-
-# Enable cuDNN autotuning and TF32. Sliding-window inference runs a fixed roi
-# size, so cuDNN's benchmark mode quickly settles on the fastest conv algorithm.
-# TF32 (Ampere+; a no-op on older cards) accelerates fp32 paths at precision
-# that is irrelevant for denoising.
-torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-
-# AMP API compatibility: PyTorch 2.0+ exposes torch.autocast (device-agnostic),
-# while older PyTorch (~1.6 to ~1.13) exposes torch.cuda.amp.autocast. Both are
-# functionally equivalent for our usage; we pick whichever is available so the
-# pipeline runs on older toolchains too.
-if hasattr(torch, "autocast"):
-
-    def _amp_autocast(enabled):
-        return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=enabled)
-
-else:
-
-    def _amp_autocast(enabled):
-        return torch.cuda.amp.autocast(enabled=enabled)
-
-
-# torch.load gained a `weights_only` keyword in PyTorch 1.13 (and the default
-# flipped to True in 2.6 with a FutureWarning otherwise). On older PyTorch the
-# argument doesn't exist and passing it raises TypeError. Detect once and call
-# torch.load with or without the kwarg accordingly.
-import inspect as _inspect
-
-_TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = (
-    "weights_only" in _inspect.signature(torch.load).parameters
-)
-del _inspect
-
-
-def _safe_torch_load(path, map_location):
-    if _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY:
-        return torch.load(path, map_location=map_location, weights_only=True)
-    return torch.load(path, map_location=map_location)
-
-
-def setup_logging() -> None:
-    """
-    Configure logging settings for the inference script.
-
-    This function sets up the logging module to provide informative output
-    during the inference process, including timestamps.
-    """
-    logging.basicConfig(
-        level=logging.INFO,  # Show INFO level and above messages
-        format="%(asctime)s - %(message)s",  # Include timestamp but remove log level
-        datefmt="%Y-%m-%d %H:%M:%S",  # Timestamp format
-    )
-
-
-def _cuda_device_arg(s):
-    """argparse type for --cuda_device: accepts 'auto' or a non-negative int."""
-    if s == "auto":
-        return s
-    try:
-        value = int(s)
-    except ValueError:
-        import argparse
-
-        raise argparse.ArgumentTypeError(
-            f"--cuda_device must be 'auto' or an integer, got {s!r}"
-        )
-    if value < 0:
-        import argparse
-
-        raise argparse.ArgumentTypeError(f"--cuda_device must be >= 0, got {value}")
-    return value
-
-
-def _select_cuda_device(arg):
-    """Resolve --cuda_device to a concrete GPU index.
-
-    Returns a tuple (index, info_string). For an explicit integer the info
-    string is empty. For successful 'auto' selection the info string
-    summarizes the choice so the caller can fold it into a single log line.
-    Warnings are logged directly here and the index falls back to 0.
-
-    Free memory is queried via torch.cuda.mem_get_info when available
-    (PyTorch 1.11+), which respects CUDA_VISIBLE_DEVICES and only reports
-    GPUs PyTorch can actually use. We fall back to nvidia-smi only when
-    that API is missing, and refuse to trust nvidia-smi if its device
-    count disagrees with what PyTorch sees -- because nvidia-smi reports
-    physical GPUs, not the subset visible to PyTorch.
-    """
-    if isinstance(arg, int):
-        return arg, ""
-    if arg != "auto":
-        return int(arg), ""
-
-    if not torch.cuda.is_available():
-        return 0, ""
-
-    n_visible = torch.cuda.device_count()
-    if n_visible == 0:
-        return 0, ""
-
-    # Preferred path: PyTorch's own per-device free-memory query.
-    try:
-        free = []
-        for i in range(n_visible):
-            free_bytes, _ = torch.cuda.mem_get_info(i)
-            free.append(free_bytes // (1024**2))
-        idx = max(range(len(free)), key=lambda i: free[i])
-        return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
-    except AttributeError:
-        pass  # PyTorch < 1.11: mem_get_info not available, fall through
-
-    # Fallback: nvidia-smi. Only trust it if its device count matches
-    # PyTorch's view; otherwise CUDA_VISIBLE_DEVICES (or similar) is
-    # restricting PyTorch and the indices would be mis-mapped.
-    try:
-        import subprocess
-
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-            text=True,
-        )
-        free = [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
-        if len(free) != n_visible:
-            logging.warning(
-                f"    --cuda_device auto: nvidia-smi reports {len(free)} GPUs but "
-                f"PyTorch sees {n_visible} (likely CUDA_VISIBLE_DEVICES is set); "
-                f"falling back to cuda:0 for safety."
-            )
-            return 0, ""
-        idx = max(range(len(free)), key=lambda i: free[i])
-        return idx, f"auto-selected, {free[idx]} MiB free; free per GPU: {free}"
-    except (subprocess.SubprocessError, FileNotFoundError, ValueError) as e:
-        logging.warning(
-            f"    --cuda_device auto: nvidia-smi failed ({e}); falling back to 0"
-        )
-        return 0, ""
+# Output formats this pipeline can write. Anything else is rejected at config
+# parse time rather than silently reinterpreted as a per-slice dump.
+SUPPORTED_OUTPUT_SUFFIXES = {".tif", ".tiff"}
 
 
 def _load_and_preprocess_volume(
-    volume_path: str, mean_std_norm: Optional[Tuple[float, float]] = None
-) -> Tuple[torch.Tensor, float, float]:
+    volume_path: str,
+    device: torch.device,
+    mean_std_norm: Optional[Tuple[float, float]] = None,
+) -> Tuple[torch.Tensor, float, float, np.dtype]:
     """
     Load a 3D volume from disk and apply preprocessing for inference.
 
     Args:
         volume_path: File path to the volume file
+        device: Device the volume must be placed on. This has to be the same
+                device the model lives on -- a bare .cuda() would ignore the
+                --cuda_device selection and strand the volume on cuda:0.
         mean_std_norm: Optional tuple of (mean, std) for z-score normalization.
                       If None, computes mean and std from the volume.
 
     Returns:
-        Tuple of (preprocessed_tensor, mean, std) where:
+        Tuple of (preprocessed_tensor, mean, std, source_dtype) where:
         - tensor: Preprocessed tensor of shape (1, 1, depth, height, width) ready for inference
         - mean: Mean value used for normalization
         - std: Standard deviation used for normalization
+        - source_dtype: dtype of the file on disk, so the output can be written
+          back in the same format the input used
 
     Raises:
         FileNotFoundError: If the volume file doesn't exist
@@ -189,13 +72,18 @@ def _load_and_preprocess_volume(
         raise FileNotFoundError(f"Volume file not found: {volume_path}")
 
     try:
-        # Load the volume from TIFF file and convert to float32 for precision
-        volume = tifffile.imread(volume_path).astype(np.float32)
+        # Load the volume from TIFF file and convert to float32 for precision.
+        # The on-disk dtype is kept so save_output can restore it.
+        raw = tifffile.imread(volume_path)
+        source_dtype = raw.dtype
+        volume = raw.astype(np.float32)
+        del raw
 
-        # Apply z-score normalization
+        # Apply z-score normalization (shared helper, so training and inference
+        # cannot drift apart on the epsilon guard)
         if mean_std_norm is not None:
             mean, std = mean_std_norm
-            volume = (volume - mean) / std
+            volume = zscore_normalize(volume, mean, std)
             logging.info(
                 f"    Applied normalization with stored mean = {mean:.6f}, std = {std:.6f}"
             )
@@ -203,7 +91,7 @@ def _load_and_preprocess_volume(
             # Compute mean and std from the volume itself
             mean = volume.mean()
             std = volume.std()
-            volume = (volume - mean) / std
+            volume = zscore_normalize(volume, mean, std)
             logging.info(
                 f"    Applied normalization with computed mean = {mean:.6f}, std = {std:.6f}"
             )
@@ -214,12 +102,14 @@ def _load_and_preprocess_volume(
         # Add batch and channel dimensions: (D, H, W) -> (1, 1, D, H, W)
         tensor = tensor.unsqueeze(0).unsqueeze(0)
 
-        # Move tensor to GPU if available for faster inference
-        if torch.cuda.is_available():
-            tensor = tensor.cuda()
-            logging.info("    Moved volume tensor to GPU")
+        # Move tensor to the model's device. Explicit index: with
+        # --cuda_device auto (the default) the selected GPU is whichever has
+        # the most free memory, which is frequently not cuda:0.
+        if device.type == "cuda":
+            tensor = tensor.to(device)
+            logging.info(f"    Moved volume tensor to {device}")
 
-        return tensor, mean, std
+        return tensor, mean, std, source_dtype
 
     except Exception as e:
         raise RuntimeError(f"Failed to load or preprocess volume: {e}")
@@ -378,12 +268,16 @@ def save_output(
             # Save as separate TIFF files
             logging.info("    Saving as separate TIFF files...")
 
+            slice_stem = Path(filename).stem
+
             for j in tqdm(range(volume.shape[0]), desc="Saving output slices"):
                 # Extract the 2D slice (height x width)
                 img_np = volume[j, :, :]
 
-                # Create output filename with zero-padding for proper sorting
-                img_path = output_dir / f"output_{j:05d}.tif"
+                # Create output filename with zero-padding for proper sorting.
+                # Derived from the requested filename so the caller's name is
+                # honored rather than silently replaced.
+                img_path = output_dir / f"{slice_stem}_{j:05d}.tif"
 
                 # Prepare slice-specific metadata
                 slice_metadata = metadata.copy()
@@ -653,7 +547,17 @@ def main(args) -> None:
         # Extract paths from config
         test_volume_path = config["test_volume_file"]
         checkpoint_dir = config["checkpoint_path"]
-        output_path = config["output_file"]
+        output_path = Path(config["output_file"])
+
+        # Reject unsupported output formats up front. Writing is TIFF-only, and
+        # silently reinterpreting e.g. "result.nii" as a directory of numbered
+        # .tif slices would hand back something the user never asked for.
+        if output_path.suffix.lower() not in SUPPORTED_OUTPUT_SUFFIXES:
+            raise ValueError(
+                f"'output_file' must end in one of "
+                f"{sorted(SUPPORTED_OUTPUT_SUFFIXES)} (got {output_path.name!r}). "
+                f"This pipeline writes multi-layer TIFF only."
+            )
 
         # Find the latest checkpoint in the directory
         checkpoint_path = find_latest_checkpoint(checkpoint_dir)
@@ -700,69 +604,20 @@ def main(args) -> None:
         # Create the model architecture and load trained weights
         logging.info("Creating and loading model...")
 
-        # Resolve --cuda_device ('auto' picks the GPU with the most free memory).
-        args.cuda_device, cuda_info = _select_cuda_device(args.cuda_device)
-
         # Determine CUDA device + resolve every GPU-capability-gated decision
         # (fp16, torch.compile) in one block so adjacent log lines tell the
         # user exactly what's actually enabled on this hardware.
-        if torch.cuda.is_available():
-            cuda_device = args.cuda_device
-            msg = f"    Using GPU device: cuda:{cuda_device}"
-            if cuda_info:
-                msg += f" ({cuda_info})"
-            logging.info(msg)
-            compute_major, compute_minor = torch.cuda.get_device_capability(cuda_device)
-        else:
-            cuda_device = 0
-            logging.info("    CUDA not available, using CPU")
-            compute_major, compute_minor = 0, 0
-
-        # fp16 mixed precision: needs CUDA + compute capability >= 7.0
-        # (tensor cores). On Pascal, fp16 throughput is much lower than fp32.
-        if args.half and torch.cuda.is_available() and compute_major >= 7:
-            use_amp = True
-            logging.info(
-                f"    Mixed precision (fp16): enabled "
-                f"(compute capability {compute_major}.{compute_minor})"
-            )
-        else:
-            use_amp = False
-            if not args.half:
-                reason = "--no_half"
-            elif not torch.cuda.is_available():
-                reason = "CPU"
-            else:
-                reason = (
-                    f"compute capability {compute_major}.{compute_minor} lacks "
-                    f"tensor cores; fp16 would run slower than fp32"
-                )
-            logging.info(f"    Mixed precision (fp16): disabled ({reason})")
-
-        # torch.compile is opt-in (--compile). It needs PyTorch 2.0+ + CUDA +
-        # compute capability >= 7.0 (Triton, the inductor backend, refuses to
-        # compile for compute < 7.0) and, on Windows, an MSVC toolchain +
-        # Windows SDK on PATH. Defaulting it off keeps the common path
-        # warning-free; pass --compile when the toolchain is set up.
-        if not args.compile:
-            use_compile = False
-            logging.info(
-                "    torch.compile: disabled (default; pass --compile to enable)"
-            )
-        elif not hasattr(torch, "compile"):
-            use_compile = False
-            logging.info("    torch.compile: disabled (PyTorch < 2.0)")
-        elif not torch.cuda.is_available() or compute_major < 7:
-            use_compile = False
-            logging.info(
-                f"    torch.compile: disabled "
-                f"(compute capability {compute_major}.x lacks Triton backend support; requires >= 7.0)"
-            )
-        else:
-            use_compile = True
-            logging.info(
-                "    torch.compile: enabled (--compile; will compile on first inference call)"
-            )
+        # ('auto' picks the GPU with the most free memory.)
+        device, cuda_device, compute_major, compute_minor = resolve_device(
+            args.cuda_device
+        )
+        args.cuda_device = cuda_device
+        use_amp = resolve_mixed_precision(
+            args.half, device, compute_major, compute_minor
+        )
+        use_compile = resolve_compile(
+            args.compile, device, compute_major, "first inference call"
+        )
 
         # Create model (with architecture from training parameters).
         # The norm_division_factor is read from the checkpoint's params.json
@@ -797,24 +652,16 @@ def main(args) -> None:
         # Load the trained weights from checkpoint
         model = load_checkpoint(model, checkpoint_path)
 
-        # Apply the already-resolved torch.compile decision. The wrap itself
-        # can still raise on edge cases unrelated to compute capability;
-        # fall back to eager mode in that case.
-        if use_compile:
-            try:
-                model = torch.compile(model)
-            except Exception as e:
-                logging.warning(
-                    f"    torch.compile failed at wrap time; using eager mode: {e}"
-                )
+        # Apply the already-resolved torch.compile decision.
+        model = maybe_compile(model, use_compile)
 
         # Phase separator
         logging.info("")
 
         # Load and preprocess the volume (with normalization stats if available)
         logging.info("Loading and preprocessing volume...")
-        test_volume, norm_mean, norm_std = _load_and_preprocess_volume(
-            test_volume_path, norm_stats
+        test_volume, norm_mean, norm_std, source_dtype = _load_and_preprocess_volume(
+            test_volume_path, device, norm_stats
         )
 
         # Phase separator
@@ -834,11 +681,18 @@ def main(args) -> None:
         )
         output_shape = pred_volume.shape
 
-        # GPU RAM memory monitoring:
+        # GPU RAM memory monitoring. Reserved (allocator-level) is the headline
+        # figure: it is what nvidia-smi reports and what determines whether the
+        # run fits on a given card. Allocated (live tensors only) is shown
+        # alongside it because the gap indicates allocator fragmentation.
         peak_vram_gb = 0.0
         if torch.cuda.is_available():
-            peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
-            logging.info(f"GPU memory peak: {peak_vram_gb:.2f} GB")
+            peak_vram_gb = torch.cuda.max_memory_reserved() / 1024**3
+            allocated_gb = torch.cuda.max_memory_allocated() / 1024**3
+            logging.info(
+                f"GPU memory peak: {peak_vram_gb:.2f} GB reserved "
+                f"({allocated_gb:.2f} GB allocated)"
+            )
             torch.cuda.reset_peak_memory_stats()
 
         # RAM memory monitoring:
@@ -846,22 +700,42 @@ def main(args) -> None:
         peak_ram_gb = process.memory_info().rss / 1024**3
         logging.info(f"RAM memory peak: {peak_ram_gb:.2f} GB")
 
-        # Denormalize the output volume back to original gray level range
-        pred_volume = pred_volume * norm_std + norm_mean
+        # Denormalize the output volume back to original gray level range.
+        # zscore_normalize divides by (std + NORM_EPS), so invert with the same
+        # denominator rather than std alone.
+        pred_volume = pred_volume * (norm_std + NORM_EPS) + norm_mean
         logging.info(
             f"Denormalized output volume using mean={norm_mean:.6f}, std={norm_std:.6f}"
         )
+
+        # Restore the source dtype so downstream tools receive the format they
+        # supplied. Integer sources are clipped to the type's range and rounded;
+        # without the clip, values the network pushed slightly past the range
+        # would wrap around on cast. --output_float32 keeps the raw float
+        # prediction for further numerical processing.
+        if args.output_float32:
+            logging.info("    Output dtype: float32 (--output_float32)")
+        elif np.issubdtype(source_dtype, np.integer):
+            info = np.iinfo(source_dtype)
+            clipped = np.clip(pred_volume, info.min, info.max)
+            n_clipped = int(np.count_nonzero(clipped != pred_volume))
+            pred_volume = np.rint(clipped).astype(source_dtype)
+            msg = f"    Output dtype: restored to {source_dtype}"
+            if n_clipped:
+                msg += (
+                    f" ({n_clipped} voxel(s) clipped to " f"[{info.min}, {info.max}])"
+                )
+            logging.info(msg)
+        else:
+            pred_volume = pred_volume.astype(source_dtype)
+            logging.info(f"    Output dtype: restored to {source_dtype}")
 
         # Phase separator
         logging.info("")
 
         # Save the denoised volume
         logging.info("Saving output...")
-        output_path = Path(output_path)
         output_dir = output_path.parent
-
-        # Determine if output should be multilayer based on file extension
-        multilayer = output_path.suffix.lower() in {".tif", ".tiff"}
 
         save_output(
             pred_volume,
@@ -871,7 +745,8 @@ def main(args) -> None:
             args.batch_size,
             cuda_device,
             args.compression,
-            multilayer,
+            # Output format is validated to be TIFF at config-parse time.
+            True,
             output_path.name,
             args.input_json,
             checkpoint_path,
@@ -933,12 +808,17 @@ if __name__ == "__main__":
         "--overlap",
         default=0.5,
         type=float,
-        help="Overlap ratio between patches for sliding window inference",
+        help="Overlap ratio between patches for sliding window inference (default: 0.5). Patch count -- and so runtime -- scales roughly as 1/(1-overlap)^3, so 0.85 costs about 8x more than 0.5. Gaussian-weighted blending suppresses patch-boundary seams well at the default, but on data with strong low-frequency structure seams can still appear; raise the overlap if you see a patch grid in the output.",
     )
     parse.add_argument(
         "--no_compression",
         action="store_true",
         help="Disable compression in output TIFF files (default: enabled)",
+    )
+    parse.add_argument(
+        "--output_float32",
+        action="store_true",
+        help="Write the output as float32 instead of restoring the input volume's dtype (default: restore). Use when the denoised volume feeds further numerical processing and you do not want it quantized back to the source bit depth.",
     )
     parse.add_argument(
         "--no_half",
