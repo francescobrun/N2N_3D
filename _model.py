@@ -339,14 +339,36 @@ class ResidualUNet(torch.nn.Module):
 
 
 def create_model(
-    device=0, norm_division_factor=56, num_res_units=0, unet_depth=4, unet_stride=2
+    device=0,
+    norm_division_factor=56,
+    num_res_units=0,
+    unet_depth=4,
+    unet_stride=2,
+    residual=True,
 ):
     """
-    Create a 3D U-Net model with configurable normalization, wrapped in
-    image-level residual learning mode (output = input + unet(input)).
+    Create a 3D U-Net model with configurable normalization, in either
+    image-level residual mode (output = input + unet(input)) or direct
+    prediction mode (output = unet(input)).
 
     Args:
         device (int): The device to use (default: 0 for GPU, or 'cpu' for CPU)
+        residual (bool): Prediction mode (default: True, i.e. residual).
+
+                True wraps the U-Net so it learns the per-voxel *correction*
+                applied to the input; see ResidualUNet for why this bounds the
+                systematic mean drift that direct prediction can exhibit.
+
+                False returns the bare U-Net, which estimates the denoised
+                volume directly. This is the original formulation and remains
+                available for comparison.
+
+                The two modes produce different state_dict key namespaces
+                (``unet.model.0...`` vs ``model.0...``), which is deliberate: a
+                checkpoint loaded in the wrong mode fails with a key mismatch
+                instead of silently running a correction-predicting network as
+                a whole-volume predictor. The mode is recorded in params.json
+                as ``residual_learning`` so inference reconstructs it.
         unet_depth (int): Number of U-Net levels, i.e. the length of the channel
                 schedule (default: 4). Channels start at 56 and double per level,
                 so depth 4 = (56, 112, 224, 448) and depth 3 = (56, 112, 224).
@@ -378,11 +400,15 @@ def create_model(
                 means layer normalization (num_groups=1) -- empirically the best
                 pairing with the residual learning wrapper, because it preserves
                 inter-channel structure that helps signal/noise discrimination.
-                Setting it to 1 selects instance normalization (num_groups=56);
-                intermediate divisors give true group normalization.
+                (That comparison was run in residual mode; it has not been
+                re-measured for direct prediction.) Setting it to 1 selects
+                instance normalization (num_groups=56); intermediate divisors
+                give true group normalization.
     Returns:
-        torch.nn.Module: a ResidualUNet wrapping the underlying MONAI UNet.
-        The inner network is accessible as ``model.unet``.
+        torch.nn.Module: in residual mode, a ResidualUNet wrapping the MONAI
+        UNet, with the inner network accessible as ``model.unet``; in direct
+        mode, the MONAI UNet itself. Callers that need the inner network in
+        both cases should use ``getattr(model, "unet", model)``.
     """
     if not isinstance(unet_depth, int) or unet_depth < 2:
         raise ValueError(f"unet_depth must be an integer >= 2, got {unet_depth}")
@@ -421,7 +447,9 @@ def create_model(
         dropout=0.0,
     )
 
-    model = ResidualUNet(unet)
+    # Residual mode wraps the network so it predicts the correction; direct
+    # mode returns the bare U-Net, which predicts the denoised volume itself.
+    model = ResidualUNet(unet) if residual else unet
 
     # Handle device setup
     if torch.cuda.is_available() and device != "cpu":

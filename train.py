@@ -709,6 +709,15 @@ def main(params):
         params.compile, device, compute_major, "first training step"
     )
 
+    # Prediction mode: residual (the network learns the correction added to the
+    # input) or direct (it reconstructs the denoised volume outright). Logged
+    # here alongside the other resolved decisions.
+    residual = params.prediction_mode == "residual"
+    if residual:
+        logging.info("    Prediction mode: residual (output = input + unet(input))")
+    else:
+        logging.info("    Prediction mode: direct (output = unet(input))")
+
     # Initialize the model to be trained
     model = create_model(
         device=params.cuda_device if torch.cuda.is_available() else "cpu",
@@ -716,6 +725,7 @@ def main(params):
         num_res_units=params.num_res_units,
         unet_depth=params.unet_depth,
         unet_stride=params.unet_stride,
+        residual=residual,
     )
 
     # Create the memory-efficient data loading pipeline
@@ -757,7 +767,10 @@ def main(params):
         min_lr=LR_SCHED_MIN_LR,
     )
 
-    # Save the training parameters including normalization statistics
+    # Save the training parameters including normalization statistics.
+    # In direct mode create_model returns the bare UNet, so there is no .unet
+    # attribute to read the architecture fields from.
+    inner_unet = getattr(model, "unet", model)
     params_dict = dict(vars(params))
     params_dict.update(
         {
@@ -782,23 +795,26 @@ def main(params):
             "training_mixed_precision": use_amp,
             "training_crop": train_dataset.crop,
             "training_circle_mask": train_dataset.circle_mask,
-            # Image-level residual learning: the trained model computes
-            # output = input + unet(input). Recorded in params.json so any
-            # downstream tooling that needs to reason about checkpoint type
-            # can detect it without inspecting state_dict keys.
-            "residual_learning": True,
-            # UNet model architecture parameters (read from the inner unet,
-            # which is wrapped by ResidualUNet on this branch).
-            "unet_in_channels": model.unet.in_channels,
-            "unet_out_channels": model.unet.out_channels,
-            "unet_channels": model.unet.channels,
-            "unet_strides": model.unet.strides,
-            "unet_kernel_size": model.unet.kernel_size,
-            "unet_up_kernel_size": model.unet.up_kernel_size,
-            "unet_num_res_units": model.unet.num_res_units,
-            "unet_act": model.unet.act,
-            "unet_norm": model.unet.norm,
-            "unet_dropout": model.unet.dropout,
+            # Prediction mode. True means the trained model computes
+            # output = input + unet(input); False means output = unet(input).
+            # Inference keys off this to rebuild the matching wrapper -- the two
+            # modes have different state_dict key namespaces, so it must be
+            # recorded. Kept as a boolean (rather than only the prediction_mode
+            # string, which dict(vars(params)) also writes) because every
+            # checkpoint since the residual wrapper was introduced has it.
+            "residual_learning": residual,
+            # UNet model architecture parameters, read from the inner unet in
+            # residual mode and from the model itself in direct mode.
+            "unet_in_channels": inner_unet.in_channels,
+            "unet_out_channels": inner_unet.out_channels,
+            "unet_channels": inner_unet.channels,
+            "unet_strides": inner_unet.strides,
+            "unet_kernel_size": inner_unet.kernel_size,
+            "unet_up_kernel_size": inner_unet.up_kernel_size,
+            "unet_num_res_units": inner_unet.num_res_units,
+            "unet_act": inner_unet.act,
+            "unet_norm": inner_unet.norm,
+            "unet_dropout": inner_unet.dropout,
         }
     )
     with open(checkpoint_dir / "params.json", "w") as par_file:
@@ -891,10 +907,16 @@ if __name__ == "__main__":
         help="Downsampling factor applied uniformly at every U-Net stage (default: 2). Set to 1 for a no-downsampling, full-resolution network: the sharpest option since no spatial information is lost, but dramatically more memory- and compute-hungry. Must be >= 1. Recorded in params.json so inference reconstructs the matching architecture.",
     )
     parse.add_argument(
+        "--prediction_mode",
+        default="residual",
+        choices=["residual", "direct"],
+        help="What the network estimates (default: residual). 'residual' has it predict the per-voxel correction applied to the input (output = input + unet(input)), which bounds the systematic mean drift that direct prediction can show. 'direct' has it reconstruct the denoised volume outright (output = unet(input)) -- the original formulation, kept available for comparison. The two modes are different architectures and are NOT checkpoint-compatible, so switching **requires retraining**. Recorded in params.json so inference rebuilds the matching model automatically.",
+    )
+    parse.add_argument(
         "--norm_division_factor",
         default=56,
         type=int,
-        help="Division factor for group normalization. 56 (default) = layer norm (num_groups=1), the best pairing with residual learning; 1 = instance norm (num_groups=56); intermediate divisors of 56 give true group norm. Valid values: 1, 2, 4, 7, 8, 14, 28, 56.",
+        help="Division factor for group normalization. 56 (default) = layer norm (num_groups=1), the best pairing with residual learning (not re-measured for --prediction_mode direct); 1 = instance norm (num_groups=56); intermediate divisors of 56 give true group norm. Valid values: 1, 2, 4, 7, 8, 14, 28, 56.",
     )
     parse.add_argument(
         "--num_workers",

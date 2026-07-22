@@ -161,6 +161,23 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> torch.nn.Mo
             # Remove 'module.' prefix from all keys
             state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
 
+        # Catch a prediction-mode mismatch before load_state_dict reports it as
+        # a wall of missing/unexpected keys. Residual checkpoints namespace
+        # every key under 'unet.'; direct ones do not, so the disagreement is
+        # unambiguous and the params.json field is the thing to fix.
+        ckpt_is_residual = any(k.startswith("unet.") for k in state_dict.keys())
+        model_is_residual = any(
+            k.startswith("unet.") for k in model.state_dict().keys()
+        )
+        if ckpt_is_residual != model_is_residual:
+            raise RuntimeError(
+                f"Prediction-mode mismatch: the checkpoint was trained in "
+                f"{'residual' if ckpt_is_residual else 'direct'} mode but the model "
+                f"was built in {'residual' if model_is_residual else 'direct'} mode. "
+                f"Inference reads this from 'residual_learning' in params.json "
+                f"(missing = direct); correct that field to match the weights."
+            )
+
         # Load state dict with the corrected keys
         model.load_state_dict(state_dict)
 
@@ -641,12 +658,23 @@ def main(args) -> None:
         unet_stride = network_params.get("unet_stride", 2)
         logging.info(f"    Using unet_depth: {unet_depth}, unet_stride: {unet_stride}")
 
+        # Prediction mode must match training: residual wraps the U-Net (state
+        # dict keys prefixed 'unet.'), direct uses it bare. Falls back to direct
+        # for legacy checkpoints that predate the field -- those were trained
+        # before the residual wrapper existed, so a bare U-Net is correct for
+        # them; every checkpoint since records the field explicitly.
+        residual = network_params.get("residual_learning", False)
+        logging.info(
+            f"    Using prediction mode: {'residual' if residual else 'direct'}"
+        )
+
         model = create_model(
             device=cuda_device if torch.cuda.is_available() else "cpu",
             norm_division_factor=norm_division_factor,
             num_res_units=num_res_units,
             unet_depth=unet_depth,
             unet_stride=unet_stride,
+            residual=residual,
         )
 
         # Load the trained weights from checkpoint
