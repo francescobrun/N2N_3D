@@ -88,22 +88,47 @@ def _cube_rotation_group():
 
 CUBE_ROTATIONS = _cube_rotation_group()
 
+# The 8 rotations that leave the z axis (axis 0) on axis 0, i.e. that never swap
+# the gantry axis into the imaging plane. Selected by --augment_symmetry inplane.
+Z_PRESERVING_ROTATIONS = [r for r in CUBE_ROTATIONS if r[0][0] == 0]
+
 
 class CubeSymmetryTransform:
     """
-    Complete set of 24 rotational symmetries of a cube.
-    A single random orientation is drawn from the 24 proper rotations of a cube
-    and applied identically to every tensor in the pair, followed by a 50%
-    horizontal flip — together covering the full 48-element octahedral group.
+    Random orientation drawn from the symmetries of a cube, applied identically
+    to every tensor in the pair, followed by a 50% horizontal flip.
+
+    Two groups are available, selected by ``inplane_only``:
+
+    * ``True`` (--augment_symmetry inplane): the 8 rotations that keep z on
+      axis 0, plus the flip -- 16 orientations. Rotations that would swap the
+      gantry axis into the imaging plane are excluded. With isotropic voxels
+      such a swap is geometrically valid, but CT reconstruction noise is not
+      isotropic: streaks, rings and cupping live *in-plane*, while noise is far
+      more independent across slices. Feeding the network axis-swapped samples
+      therefore teaches it to expect in-plane artifact structure along z, where
+      it never occurs -- actively misleading for a denoiser whose whole job is
+      modelling noise structure.
+    * ``False`` (--augment_symmetry full): all 24 proper rotations plus the
+      flip -- the full 48-element octahedral group. Maximum augmentation
+      diversity, correct only when the noise really is direction-agnostic.
+
+    Keeping z on axis 0 also means the last two tensor dims are always the y-x
+    imaging plane, which is what --rotation_loss relies on: both of its variants
+    rotate in dims (-2, -1) and would otherwise be rotating in a plane
+    containing the gantry axis roughly two-thirds of the time.
 
     Operates directly on (C, D, H, W) tensors. The same random orientation is
     applied to both members of the pair so the two noisy copies stay registered.
     Uses explicit permutation matrices for maximum robustness and performance.
     """
 
+    def __init__(self, inplane_only):
+        self.rotations = Z_PRESERVING_ROTATIONS if inplane_only else CUBE_ROTATIONS
+
     def _apply_rotation(self, tensor, rotation_idx):
         """Apply a specific rotation using permutation indices."""
-        axes_perm, flip_dirs = CUBE_ROTATIONS[rotation_idx]
+        axes_perm, flip_dirs = self.rotations[rotation_idx]
 
         # Apply axis permutation
         tensor = tensor.permute(axes_perm)
@@ -116,10 +141,9 @@ class CubeSymmetryTransform:
         return tensor
 
     def __call__(self, tensors):
-        """Apply one of 24 rotational symmetries + optional horizontal flip to
-        a list of (C, D, H, W) tensors, returning the transformed list."""
-        # Randomly select one of 24 rotations
-        rotation_idx = torch.randint(0, 24, [1]).item()
+        """Apply one random rotation from the selected group + optional
+        horizontal flip to a list of (C, D, H, W) tensors."""
+        rotation_idx = torch.randint(0, len(self.rotations), [1]).item()
         # Random horizontal flip with 50% probability
         cur_h_flip = torch.randint(0, 2, [1]).item()
 
@@ -284,7 +308,12 @@ class N2IDataset(Dataset):
     """
 
     def __init__(
-        self, dataset_name, training_patch_size, nb_patches, normalization=True
+        self,
+        dataset_name,
+        training_patch_size,
+        nb_patches,
+        normalization=True,
+        augment_symmetry="inplane",
     ):
 
         # Load dataset metadata
@@ -432,7 +461,9 @@ class N2IDataset(Dataset):
 
         # Reused for every __getitem__ call; the transform is stateless (random
         # state is sampled fresh inside apply_transform).
-        self.transform = CubeSymmetryTransform()
+        self.transform = CubeSymmetryTransform(
+            inplane_only=augment_symmetry == "inplane"
+        )
 
     def _load_patch(self, volume, start_coords):
         """Extract a patch from preloaded volume.
@@ -818,6 +849,24 @@ def main(params):
     else:
         logging.info("    Prediction mode: direct (output = unet(input))")
 
+    # Augmentation group and rotation loss, logged with the other resolved
+    # decisions. 'inplane' keeps z on axis 0, which is what makes the last two
+    # dims the imaging plane for --rotation_loss.
+    n_orientations = (
+        len(
+            Z_PRESERVING_ROTATIONS
+            if params.augment_symmetry == "inplane"
+            else CUBE_ROTATIONS
+        )
+        * 2
+    )
+    logging.info(
+        f"    Augmentation symmetry: {params.augment_symmetry} "
+        f"({n_orientations} orientations)"
+    )
+    if params.rotation_loss != "none":
+        logging.info(f"    Rotation loss: {params.rotation_loss}")
+
     # Initialize the model to be trained
     model = create_model(
         device=params.cuda_device if torch.cuda.is_available() else "cpu",
@@ -831,7 +880,11 @@ def main(params):
     # Create the memory-efficient data loading pipeline
     logging.info("Setting up data loader...")
     train_dataset = N2IDataset(
-        params.input_json, TRAIN_PATCH_SIZE, NB_PATCH_PER_EPOCH, normalization=True
+        params.input_json,
+        TRAIN_PATCH_SIZE,
+        NB_PATCH_PER_EPOCH,
+        normalization=True,
+        augment_symmetry=params.augment_symmetry,
     )
 
     train_loader = DataLoader(
@@ -1018,6 +1071,12 @@ if __name__ == "__main__":
         default=56,
         type=int,
         help="Division factor for group normalization. 56 (default) = layer norm (num_groups=1), the best pairing with residual learning (not re-measured for --prediction_mode direct); 1 = instance norm (num_groups=56); intermediate divisors of 56 give true group norm. Valid values: 1, 2, 4, 7, 8, 14, 28, 56.",
+    )
+    parse.add_argument(
+        "--augment_symmetry",
+        default="inplane",
+        choices=["inplane", "full"],
+        help="Which cube symmetries to use for training augmentation (default: inplane). 'inplane' draws from the 8 rotations that keep z on axis 0, plus the 50%% horizontal flip -- 16 orientations, none of which swap the gantry axis into the imaging plane. With isotropic voxels that swap is geometrically valid, but CT reconstruction noise is not isotropic (streaks, rings and cupping are in-plane phenomena, while noise is far more independent across slices), so axis-swapped samples teach the network to expect in-plane artifact structure along z where it never occurs. 'full' restores the previous behaviour: all 24 rotations plus the flip (the full 48-element octahedral group), which triples augmentation diversity and is correct only if your noise really is direction-agnostic. 'inplane' also guarantees the last two tensor dims are the y-x imaging plane, which --rotation_loss depends on.",
     )
     parse.add_argument(
         "--rotation_loss",
