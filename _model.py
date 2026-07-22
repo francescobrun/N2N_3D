@@ -328,6 +328,13 @@ class ResidualUNet(torch.nn.Module):
     objective: the network learns the conditional mean of (target - input),
     which is the conditional mean of (clean - input) plus a zero-mean noise
     term that integrates out.
+
+    The identity path cuts both ways, which is why direct prediction remains
+    selectable (``create_model(residual=False)``): where the network predicts
+    ~0 correction the input passes through *including its noise*, so residual
+    output can look grainier in flat regions than a direct prediction that is
+    free to reshape the whole intensity distribution. Residual preserves
+    quantitative values; direct sometimes looks better qualitatively.
     """
 
     def __init__(self, unet):
@@ -388,7 +395,9 @@ def create_model(
         num_res_units (int): Number of residual conv units per level inside the
                 MONAI U-Net (default: 0, a plain conv block per level). This is
                 MONAI's *intra-block* residual learning and is distinct from the
-                image-level residual wrapper (ResidualUNet). Values of 1 or 2 add
+                image-level residual wrapper (ResidualUNet) selected by the
+                ``residual`` argument; the two are independent and can be
+                combined. Values of 1 or 2 add
                 deeper per-level blocks with internal skip connections, which can
                 improve denoising fidelity / edge sharpness at the cost of more
                 compute, memory, and parameters. The value is recorded in

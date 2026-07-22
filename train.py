@@ -48,6 +48,13 @@ LR_SCHED_FACTOR = 0.5  # Multiply lr by this on plateau
 LR_SCHED_PATIENCE = 4  # Epochs without improvement before reducing
 LR_SCHED_MIN_LR = 1e-6  # Floor below which lr is not reduced further
 
+# Rotation-equivariance loss (--rotation_equivariance, opt-in). Number of extra
+# 90-degree in-plane rotations sampled per step, without replacement, from the
+# 3 non-trivial choices {90, 180, 270}. Must be in {1, 2, 3} -- sampling without
+# replacement from a 3-element set can't exceed 3. 2 matches the default used
+# by Xu & Perelli, "Rotational Augmented Noise2Inverse" (IEEE TRPMS 2023).
+R_EQUIVARIANCE_ROTATIONS = 2
+
 
 # ============================================================================
 # CUSTOM TRANSFORMS AND DATASET CLASSES
@@ -515,6 +522,7 @@ def train_model(
     device,
     use_amp,
     keep_only_last,
+    rotation_equivariance,
 ):
     """Train the model with logic similar to train_old.py."""
 
@@ -565,6 +573,7 @@ def train_model(
         # calling .item() every iteration (each .item() forces a GPU->CPU
         # synchronization that serializes the training step).
         epoch_loss_sum = torch.zeros((), device=device)
+        epoch_equiv_loss_sum = torch.zeros((), device=device)
 
         for batch in tqdm(dl, desc=f"Epoch {epoch+1}/{nb_train_epoch}"):
             # Per-sample: with 50% probability swap which noisy copy is input vs. target
@@ -588,16 +597,45 @@ def train_model(
                 # inputs + MSE produce tiny gradient magnitudes). Equivalent to
                 # using eps=1e-11; the scaling form is kept for numerical safety.
                 total_loss = loss_func(pred, target)
-                loss_val = total_loss * 1000
+
+                # Rotation-equivariance term (--rotation_equivariance, opt-in).
+                # Both input and target are rotated by the same angle and the
+                # network is trained to hit the rotated target on the rotated
+                # input -- R_EQUIVARIANCE_ROTATIONS extra forward passes, added
+                # unweighted to the primary loss (Xu & Perelli, RAN2I, Eq. 17).
+                # Restricted to the x-y plane (last two dims; z fixed) since
+                # that's the only axis pair with physical rotational symmetry
+                # for this pipeline's CT-style cylindrical-FOV data.
+                equiv_loss = torch.zeros((), device=device)
+                if rotation_equivariance:
+                    rotation_ks = (
+                        torch.randperm(3)[:R_EQUIVARIANCE_ROTATIONS] + 1
+                    ).tolist()
+                    for k in rotation_ks:
+                        input_k = torch.rot90(input, k, dims=(-2, -1))
+                        target_k = torch.rot90(target, k, dims=(-2, -1))
+                        pred_k = model(input_k)
+                        equiv_loss = equiv_loss + loss_func(pred_k, target_k)
+
+                loss_val = (total_loss + equiv_loss) * 1000
 
             scaler.scale(loss_val).backward()
             scaler.step(optimizer)
             scaler.update()
             epoch_loss_sum += loss_val.detach()
+            if rotation_equivariance:
+                epoch_equiv_loss_sum += equiv_loss.detach()
 
         # One device sync per epoch to read back the mean loss.
         epoch_loss = (epoch_loss_sum / len(dl)).item()
-        logging.info(f"Mean loss value of the epoch : {epoch_loss:.4f}")
+        if rotation_equivariance:
+            epoch_equiv_loss = (epoch_equiv_loss_sum / len(dl)).item()
+            logging.info(
+                f"Mean loss value of the epoch : {epoch_loss:.4f} "
+                f"(equivariance component: {epoch_equiv_loss:.4f})"
+            )
+        else:
+            logging.info(f"Mean loss value of the epoch : {epoch_loss:.4f}")
         loss_csv.write(f"{epoch},{epoch_loss:.6f}\n")
         loss_csv.flush()
         final_loss = epoch_loss
@@ -846,6 +884,7 @@ def main(params):
         device,
         use_amp,
         params.keep_only_last,
+        params.rotation_equivariance,
     )
 
     # End-of-run summary: total wall-clock, epochs completed, last epoch's
@@ -892,7 +931,7 @@ if __name__ == "__main__":
         "--num_res_units",
         default=0,
         type=int,
-        help="Number of residual conv units per level inside the MONAI U-Net (default: 0, a plain conv block per level). This is MONAI's intra-block residual learning, distinct from the image-level residual wrapper. Values of 1 or 2 add deeper per-level blocks with internal skip connections, which can improve denoising fidelity / edge sharpness at the cost of more compute, memory, and parameters. Recorded in params.json so inference reconstructs the matching architecture.",
+        help="Number of residual conv units per level inside the MONAI U-Net (default: 0, a plain conv block per level). This is MONAI's intra-block residual learning, distinct from the image-level residual wrapper selected by --prediction_mode; the two are independent and can be combined. Values of 1 or 2 add deeper per-level blocks with internal skip connections, which can improve denoising fidelity / edge sharpness at the cost of more compute, memory, and parameters. Recorded in params.json so inference reconstructs the matching architecture.",
     )
     parse.add_argument(
         "--unet_depth",
@@ -910,13 +949,18 @@ if __name__ == "__main__":
         "--prediction_mode",
         default="residual",
         choices=["residual", "direct"],
-        help="What the network estimates (default: residual). 'residual' has it predict the per-voxel correction applied to the input (output = input + unet(input)), which bounds the systematic mean drift that direct prediction can show. 'direct' has it reconstruct the denoised volume outright (output = unet(input)) -- the original formulation, kept available for comparison. The two modes are different architectures and are NOT checkpoint-compatible, so switching **requires retraining**. Recorded in params.json so inference rebuilds the matching model automatically.",
+        help="What the network estimates (default: residual). A quantitative-vs-qualitative trade-off: pick it based on what you do with the output. 'residual' predicts the per-voxel correction applied to the input (output = input + unet(input)); intensity is preserved by construction, bounding the systematic mean drift direct prediction can show, and in our experience it preserves quantitative values more faithfully -- use it when absolute voxel values matter (densitometry, attenuation coefficients, measurements taken off the intensities). 'direct' reconstructs the denoised volume outright (output = unet(input)); free of the identity path it can reshape the whole intensity distribution and in our experience sometimes looks qualitatively better at the cost of quantitative fidelity -- use it for visual assessment or when a downstream step does not depend on absolute intensities. Note the flip side of the identity path: where the residual network predicts ~0 the input passes through including its noise, so residual output can look grainier in flat regions. The two modes are different architectures and are NOT checkpoint-compatible, so switching requires retraining. Recorded in params.json so inference rebuilds the matching model automatically.",
     )
     parse.add_argument(
         "--norm_division_factor",
         default=56,
         type=int,
         help="Division factor for group normalization. 56 (default) = layer norm (num_groups=1), the best pairing with residual learning (not re-measured for --prediction_mode direct); 1 = instance norm (num_groups=56); intermediate divisors of 56 give true group norm. Valid values: 1, 2, 4, 7, 8, 14, 28, 56.",
+    )
+    parse.add_argument(
+        "--rotation_equivariance",
+        action="store_true",
+        help="Add a rotation-equivariance term to the training loss (default: disabled). Inspired by Xu & Perelli, 'Rotational Augmented Noise2Inverse' (IEEE TRPMS 2023): for R_EQUIVARIANCE_ROTATIONS randomly chosen 90-degree in-plane (x-y) rotations per step, both input and target are rotated and the network is trained to hit the rotated target on the rotated input, added unweighted to the primary loss. Restricted to the x-y plane (z held fixed), not full 3D, matching the physically distinguished gantry axis this pipeline already assumes elsewhere (see training_circle_mask). Adds R_EQUIVARIANCE_ROTATIONS extra forward passes per step (~3x total compute at the default of 2) -- experimental, needs empirical validation on real data before adopting as default.",
     )
     parse.add_argument(
         "--num_workers",
