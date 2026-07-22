@@ -1040,70 +1040,169 @@ if __name__ == "__main__":
         "--cuda_device",
         default="auto",
         type=_cuda_device_arg,
-        help="CUDA device to use: a non-negative integer or 'auto' (picks the GPU with the most free memory via nvidia-smi). Default: auto.",
+        help=(
+            "CUDA device to use: a non-negative integer or 'auto' (picks the GPU with "
+            "the most free memory via nvidia-smi). Default: auto."
+        ),
     )
     parse.add_argument(
         "--num_res_units",
         default=0,
         type=int,
-        help="Number of residual conv units per level inside the MONAI U-Net (default: 0, a plain conv block per level). This is MONAI's intra-block residual learning, distinct from the image-level residual wrapper selected by --prediction_mode; the two are independent and can be combined. Values of 1 or 2 add deeper per-level blocks with internal skip connections, which can improve denoising fidelity / edge sharpness at the cost of more compute, memory, and parameters. Recorded in params.json so inference reconstructs the matching architecture.",
+        help=(
+            "Number of residual conv units per level inside the MONAI U-Net (default: "
+            "0, a plain conv block per level). This is MONAI's intra-block residual "
+            "learning, distinct from the image-level residual wrapper selected by "
+            "--prediction_mode; the two are independent and can be combined. Values of "
+            "1 or 2 add deeper per-level blocks with internal skip connections, which "
+            "can improve denoising fidelity / edge sharpness at the cost of more "
+            "compute, memory, and parameters. Recorded in params.json so inference "
+            "reconstructs the matching architecture."
+        ),
     )
     parse.add_argument(
         "--unet_depth",
         default=4,
         type=int,
-        help="Number of U-Net levels (default: 4). Channels start at 56 and double per level, so depth 4 = (56,112,224,448) and depth 3 = (56,112,224); there are unet_depth-1 downsampling stages. Fewer levels keep detail at a finer resolution (less of the smoothing caused by the coarse bottleneck) but shrink the receptive field; more levels widen context at the cost of more downsampling. Must be >= 2. Recorded in params.json so inference reconstructs the matching architecture.",
+        help=(
+            "Number of U-Net levels (default: 4). Channels start at 56 and double per "
+            "level, so depth 4 = (56,112,224,448) and depth 3 = (56,112,224); there are "
+            "unet_depth-1 downsampling stages. Fewer levels keep detail at a finer "
+            "resolution (less of the smoothing caused by the coarse bottleneck) but "
+            "shrink the receptive field; more levels widen context at the cost of more "
+            "downsampling. Must be >= 2. Recorded in params.json so inference "
+            "reconstructs the matching architecture."
+        ),
     )
     parse.add_argument(
         "--unet_stride",
         default=2,
         type=int,
-        help="Downsampling factor applied uniformly at every U-Net stage (default: 2). Set to 1 for a no-downsampling, full-resolution network: the sharpest option since no spatial information is lost, but dramatically more memory- and compute-hungry. Must be >= 1. Recorded in params.json so inference reconstructs the matching architecture.",
+        help=(
+            "Downsampling factor applied uniformly at every U-Net stage (default: 2). "
+            "Set to 1 for a no-downsampling, full-resolution network: the sharpest "
+            "option since no spatial information is lost, but dramatically more memory- "
+            "and compute-hungry. Must be >= 1. Recorded in params.json so inference "
+            "reconstructs the matching architecture."
+        ),
     )
     parse.add_argument(
         "--prediction_mode",
         default="residual",
         choices=["residual", "direct"],
-        help="What the network estimates (default: residual). A quantitative-vs-qualitative trade-off: pick it based on what you do with the output. 'residual' predicts the per-voxel correction applied to the input (output = input + unet(input)); intensity is preserved by construction, bounding the systematic mean drift direct prediction can show, and in our experience it preserves quantitative values more faithfully -- use it when absolute voxel values matter (densitometry, attenuation coefficients, measurements taken off the intensities). 'direct' reconstructs the denoised volume outright (output = unet(input)); free of the identity path it can reshape the whole intensity distribution and in our experience sometimes looks qualitatively better at the cost of quantitative fidelity -- use it for visual assessment or when a downstream step does not depend on absolute intensities. Note the flip side of the identity path: where the residual network predicts ~0 the input passes through including its noise, so residual output can look grainier in flat regions. The two modes are different architectures and are NOT checkpoint-compatible, so switching requires retraining. Recorded in params.json so inference rebuilds the matching model automatically.",
+        help=(
+            "What the network estimates (default: residual). A "
+            "quantitative-vs-qualitative trade-off: pick it based on what you do with "
+            "the output. 'residual' predicts the per-voxel correction applied to the "
+            "input (output = input + unet(input)); intensity is preserved by "
+            "construction, bounding the systematic mean drift direct prediction can "
+            "show, and in our experience it preserves quantitative values more "
+            "faithfully -- use it when absolute voxel values matter (densitometry, "
+            "attenuation coefficients, measurements taken off the intensities). "
+            "'direct' reconstructs the denoised volume outright (output = unet(input)); "
+            "free of the identity path it can reshape the whole intensity distribution "
+            "and in our experience sometimes looks qualitatively better at the cost of "
+            "quantitative fidelity -- use it for visual assessment or when a downstream "
+            "step does not depend on absolute intensities. Note the flip side of the "
+            "identity path: where the residual network predicts ~0 the input passes "
+            "through including its noise, so residual output can look grainier in flat "
+            "regions. The two modes are different architectures and are NOT "
+            "checkpoint-compatible, so switching requires retraining. Recorded in "
+            "params.json so inference rebuilds the matching model automatically."
+        ),
     )
     parse.add_argument(
         "--norm_division_factor",
         default=56,
         type=int,
-        help="Division factor for group normalization. 56 (default) = layer norm (num_groups=1), the best pairing with residual learning (not re-measured for --prediction_mode direct); 1 = instance norm (num_groups=56); intermediate divisors of 56 give true group norm. Valid values: 1, 2, 4, 7, 8, 14, 28, 56.",
+        help=(
+            "Division factor for group normalization. 56 (default) = layer norm "
+            "(num_groups=1), the best pairing with residual learning (not re-measured "
+            "for --prediction_mode direct); 1 = instance norm (num_groups=56); "
+            "intermediate divisors of 56 give true group norm. Valid values: 1, 2, 4, "
+            "7, 8, 14, 28, 56."
+        ),
     )
     parse.add_argument(
         "--augment_symmetry",
         default="inplane",
         choices=["inplane", "full"],
-        help="Which cube symmetries to use for training augmentation (default: inplane). 'inplane' draws from the 8 rotations that keep z on axis 0, plus the 50%% horizontal flip -- 16 orientations, none of which swap the gantry axis into the imaging plane. With isotropic voxels that swap is geometrically valid, but CT reconstruction noise is not isotropic (streaks, rings and cupping are in-plane phenomena, while noise is far more independent across slices), so axis-swapped samples teach the network to expect in-plane artifact structure along z where it never occurs. 'full' restores the previous behaviour: all 24 rotations plus the flip (the full 48-element octahedral group), which triples augmentation diversity and is correct only if your noise really is direction-agnostic. 'inplane' also guarantees the last two tensor dims are the y-x imaging plane, which --rotation_loss depends on.",
+        help=(
+            "Which cube symmetries to use for training augmentation (default: inplane). "
+            "'inplane' draws from the 8 rotations that keep z on axis 0, plus the 50%% "
+            "horizontal flip -- 16 orientations, none of which swap the gantry axis "
+            "into the imaging plane. With isotropic voxels that swap is geometrically "
+            "valid, but CT reconstruction noise is not isotropic (streaks, rings and "
+            "cupping are in-plane phenomena, while noise is far more independent across "
+            "slices), so axis-swapped samples teach the network to expect in-plane "
+            "artifact structure along z where it never occurs. 'full' restores the "
+            "previous behaviour: all 24 rotations plus the flip (the full 48-element "
+            "octahedral group), which triples augmentation diversity and is correct "
+            "only if your noise really is direction-agnostic. 'inplane' also guarantees "
+            "the last two tensor dims are the y-x imaging plane, which --rotation_loss "
+            "depends on."
+        ),
     )
     parse.add_argument(
         "--rotation_loss",
         default="none",
         choices=["none", "equivariance", "ran2i"],
-        help="Add a rotation-based term to the training loss (default: none). Both variants are experimental and act only in the x-y plane (z held fixed), matching the physically distinguished gantry axis this pipeline already assumes elsewhere (see training_circle_mask). 'equivariance' enforces the property induced by the CT geometry -- rotating the object rotates the reconstruction identically -- by penalizing the network when f(rotate(x)) differs from rotate(f(x)), over R_EQUIVARIANCE_ROTATIONS random 90-degree rotations; this costs that many extra forward passes per step (~3x total compute at the default of 2). 'ran2i' reproduces Xu & Perelli, 'Rotational Augmented Noise2Inverse' (IEEE TRPMS 2023) as implemented in their reference code (github.com/UoD-MCI/RAN2I): rotate the output and the target by RAN2I_N_TRANS random continuous angles and compare, with no extra forward pass (so it is nearly free). Note 'ran2i' does not constrain equivariance -- the network is never run on a rotated input -- and reduces to a frequency-reweighting of the primary loss; it is provided because it is the formulation behind the published results. Neither is validated on this pipeline's data.",
+        help=(
+            "Add a rotation-based term to the training loss (default: none). Both "
+            "variants are experimental and act only in the x-y plane (z held fixed), "
+            "matching the physically distinguished gantry axis this pipeline already "
+            "assumes elsewhere (see training_circle_mask). 'equivariance' enforces the "
+            "property induced by the CT geometry -- rotating the object rotates the "
+            "reconstruction identically -- by penalizing the network when f(rotate(x)) "
+            "differs from rotate(f(x)), over R_EQUIVARIANCE_ROTATIONS random 90-degree "
+            "rotations; this costs that many extra forward passes per step (~3x total "
+            "compute at the default of 2). 'ran2i' reproduces Xu & Perelli, 'Rotational "
+            "Augmented Noise2Inverse' (IEEE TRPMS 2023) as implemented in their "
+            "reference code (github.com/UoD-MCI/RAN2I): rotate the output and the "
+            "target by RAN2I_N_TRANS random continuous angles and compare, with no "
+            "extra forward pass (so it is nearly free). Note 'ran2i' does not constrain "
+            "equivariance -- the network is never run on a rotated input -- and reduces "
+            "to a frequency-reweighting of the primary loss; it is provided because it "
+            "is the formulation behind the published results. Neither is validated on "
+            "this pipeline's data."
+        ),
     )
     parse.add_argument(
         "--num_workers",
         default=4,
         type=int,
-        help="Number of DataLoader worker processes (default: 4; use 0 on very low-RAM systems)",
+        help=(
+            "Number of DataLoader worker processes (default: 4; use 0 on very low-RAM "
+            "systems)"
+        ),
     )
     parse.add_argument(
         "--no_half",
         action="store_true",
-        help="Disable fp16 mixed precision training (default: enabled on tensor-core GPUs only, i.e. compute capability >= 7.0)",
+        help=(
+            "Disable fp16 mixed precision training (default: enabled on tensor-core "
+            "GPUs only, i.e. compute capability >= 7.0)"
+        ),
     )
     parse.add_argument(
         "--compile",
         action="store_true",
-        help="Enable torch.compile (default: disabled). Gives a ~1.2-1.5x training speedup after a one-time compilation on the first step, but requires PyTorch 2.0+, a GPU with compute capability >= 7.0, and -- on Windows -- an MSVC toolchain + Windows SDK on PATH to build the kernels. Only enable it if your toolchain is set up; otherwise Triton prints repeated 'Failed to find MSVC' warnings and falls back to eager mode.",
+        help=(
+            "Enable torch.compile (default: disabled). Gives a ~1.2-1.5x training "
+            "speedup after a one-time compilation on the first step, but requires "
+            "PyTorch 2.0+, a GPU with compute capability >= 7.0, and -- on Windows -- "
+            "an MSVC toolchain + Windows SDK on PATH to build the kernels. Only enable "
+            "it if your toolchain is set up; otherwise Triton prints repeated 'Failed "
+            "to find MSVC' warnings and falls back to eager mode."
+        ),
     )
     parse.add_argument(
         "--keep_only_last",
         action="store_true",
-        help="Keep only the most recent epoch's checkpoint on disk; delete previous ones after each save (default: keep every epoch)",
+        help=(
+            "Keep only the most recent epoch's checkpoint on disk; delete previous ones "
+            "after each save (default: keep every epoch)"
+        ),
     )
 
     main(parse.parse_args())

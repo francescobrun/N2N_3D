@@ -830,13 +830,23 @@ if __name__ == "__main__":
         "--cuda_device",
         default="auto",
         type=_cuda_device_arg,
-        help="CUDA device to use: a non-negative integer or 'auto' (picks the GPU with the most free memory via nvidia-smi). Default: auto.",
+        help=(
+            "CUDA device to use: a non-negative integer or 'auto' (picks the GPU with "
+            "the most free memory via nvidia-smi). Default: auto."
+        ),
     )
     parse.add_argument(
         "--overlap",
         default=0.5,
         type=float,
-        help="Overlap ratio between patches for sliding window inference (default: 0.5). Patch count -- and so runtime -- scales roughly as 1/(1-overlap)^3, so 0.85 costs about 8x more than 0.5. Gaussian-weighted blending suppresses patch-boundary seams well at the default, but on data with strong low-frequency structure seams can still appear; raise the overlap if you see a patch grid in the output.",
+        help=(
+            "Overlap ratio between patches for sliding window inference (default: 0.5). "
+            "Patch count -- and so runtime -- scales roughly as 1/(1-overlap)^3, so "
+            "0.85 costs about 8x more than 0.5. Gaussian-weighted blending suppresses "
+            "patch-boundary seams well at the default, but on data with strong "
+            "low-frequency structure seams can still appear; raise the overlap if you "
+            "see a patch grid in the output."
+        ),
     )
     parse.add_argument(
         "--no_compression",
@@ -846,27 +856,52 @@ if __name__ == "__main__":
     parse.add_argument(
         "--output_float32",
         action="store_true",
-        help="Write the output as float32 instead of restoring the input volume's dtype (default: restore). Use when the denoised volume feeds further numerical processing and you do not want it quantized back to the source bit depth.",
+        help=(
+            "Write the output as float32 instead of restoring the input volume's dtype "
+            "(default: restore). Use when the denoised volume feeds further numerical "
+            "processing and you do not want it quantized back to the source bit depth."
+        ),
     )
     parse.add_argument(
         "--no_half",
         action="store_true",
-        help="Disable fp16 mixed precision inference (default: enabled when CUDA is available)",
+        help=(
+            "Disable fp16 mixed precision inference (default: enabled when CUDA is "
+            "available)"
+        ),
     )
     parse.add_argument(
         "--compile",
         action="store_true",
-        help="Enable torch.compile (default: disabled). Gives a ~1.2-1.5x speedup after a one-time compilation on the first inference call, but requires PyTorch 2.0+, a GPU with compute capability >= 7.0, and -- on Windows -- an MSVC toolchain + Windows SDK on PATH to build the kernels. Only enable it if your toolchain is set up; otherwise Triton prints repeated 'Failed to find MSVC' warnings and falls back to eager mode.",
+        help=(
+            "Enable torch.compile (default: disabled). Gives a ~1.2-1.5x speedup after "
+            "a one-time compilation on the first inference call, but requires PyTorch "
+            "2.0+, a GPU with compute capability >= 7.0, and -- on Windows -- an MSVC "
+            "toolchain + Windows SDK on PATH to build the kernels. Only enable it if "
+            "your toolchain is set up; otherwise Triton prints repeated 'Failed to find "
+            "MSVC' warnings and falls back to eager mode."
+        ),
     )
     parse.add_argument(
         "--no_padding",
         action="store_true",
-        help="Disable replicate-padding of the test volume by half-patch on each side (default: enabled). Padding ensures every output voxel is predicted from well-conditioned patch-center context; disabling it cuts inference time roughly 1.5-2x at the cost of slightly degraded predictions in the outermost ~half-patch of the volume.",
+        help=(
+            "Disable replicate-padding of the test volume by half-patch on each side "
+            "(default: enabled). Padding ensures every output voxel is predicted from "
+            "well-conditioned patch-center context; disabling it cuts inference time "
+            "roughly 1.5-2x at the cost of slightly degraded predictions in the "
+            "outermost ~half-patch of the volume."
+        ),
     )
     parse.add_argument(
         "--gpu_aggregation",
         action="store_true",
-        help="Keep the sliding-window aggregation buffer on GPU instead of CPU (default: CPU). Faster (eliminates per-patch sync) but costs ~2 * D * H * W * 4 bytes of extra VRAM; safe only on cards with enough headroom for the volume size.",
+        help=(
+            "Keep the sliding-window aggregation buffer on GPU instead of CPU (default: "
+            "CPU). Faster (eliminates per-patch sync) but costs ~2 * D * H * W * 4 "
+            "bytes of extra VRAM; safe only on cards with enough headroom for the "
+            "volume size."
+        ),
     )
 
     args = parse.parse_args()
