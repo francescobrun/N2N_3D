@@ -375,7 +375,7 @@ def create_model(
                 checkpoint loaded in the wrong mode fails with a key mismatch
                 instead of silently running a correction-predicting network as
                 a whole-volume predictor. The mode is recorded in params.json
-                as ``residual_learning`` so inference reconstructs it.
+                as ``prediction_mode`` so inference reconstructs it.
         unet_depth (int): Number of U-Net levels, i.e. the length of the channel
                 schedule (default: 4). Channels start at 56 and double per level,
                 so depth 4 = (56, 112, 224, 448) and depth 3 = (56, 112, 224).

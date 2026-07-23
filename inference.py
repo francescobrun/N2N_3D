@@ -174,8 +174,8 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> torch.nn.Mo
                 f"Prediction-mode mismatch: the checkpoint was trained in "
                 f"{'residual' if ckpt_is_residual else 'direct'} mode but the model "
                 f"was built in {'residual' if model_is_residual else 'direct'} mode. "
-                f"Inference reads this from 'residual_learning' in params.json "
-                f"(missing = direct); correct that field to match the weights."
+                f"Inference reads this from 'prediction_mode' in params.json; "
+                f"correct that field to match the weights."
             )
 
         # Load state dict with the corrected keys
@@ -659,11 +659,12 @@ def main(args) -> None:
         logging.info(f"    Using unet_depth: {unet_depth}, unet_stride: {unet_stride}")
 
         # Prediction mode must match training: residual wraps the U-Net (state
-        # dict keys prefixed 'unet.'), direct uses it bare. Falls back to direct
-        # for legacy checkpoints that predate the field -- those were trained
-        # before the residual wrapper existed, so a bare U-Net is correct for
-        # them; every checkpoint since records the field explicitly.
-        residual = network_params.get("residual_learning", False)
+        # dict keys prefixed 'unet.'), direct uses it bare. Read directly (no
+        # default) so a params.json missing this field fails loudly rather than
+        # silently building the wrong architecture; the state_dict key-prefix
+        # check in load_checkpoint is the backstop against a value that
+        # disagrees with the actual weights.
+        residual = network_params["prediction_mode"] == "residual"
         logging.info(
             f"    Using prediction mode: {'residual' if residual else 'direct'}"
         )

@@ -633,13 +633,19 @@ def train_model(
     first_epoch_completed = False
     final_loss = float("nan")
     for epoch in range(start_epoch_nb, nb_train_epoch):
+        # epoch is the 0-based loop index -- it drives range() and the resume
+        # counter stored in the checkpoint (state["epoch"] + 1). epoch_num is
+        # the 1-based value shown to the user everywhere: progress bar, logs,
+        # the CSV, and the checkpoint filename. Keep the two distinct so the
+        # display can be 1-based without disturbing the resume arithmetic.
+        epoch_num = epoch + 1
         # Accumulate the loss on-device and sync once per epoch, rather than
         # calling .item() every iteration (each .item() forces a GPU->CPU
         # synchronization that serializes the training step).
         epoch_loss_sum = torch.zeros((), device=device)
         epoch_equiv_loss_sum = torch.zeros((), device=device)
 
-        for batch in tqdm(dl, desc=f"Epoch {epoch+1}/{nb_train_epoch}"):
+        for batch in tqdm(dl, desc=f"Epoch {epoch_num}/{nb_train_epoch}"):
             # Per-sample: with 50% probability swap which noisy copy is input vs. target
             data1 = batch["split1_volume"].to(device, non_blocking=True)
             data2 = batch["split2_volume"].to(device, non_blocking=True)
@@ -729,7 +735,7 @@ def train_model(
             )
         else:
             logging.info(f"Mean loss value of the epoch : {epoch_loss:.4f}")
-        loss_csv.write(f"{epoch},{epoch_loss:.6f}\n")
+        loss_csv.write(f"{epoch_num},{epoch_loss:.6f}\n")
         loss_csv.flush()
         final_loss = epoch_loss
 
@@ -763,14 +769,15 @@ def train_model(
 
         first_epoch_completed = True
 
-        # Save checkpoint at each epoch
-        logging.info("Saving checkpoint for epoch n°{}...".format(epoch))
+        # Save checkpoint at each epoch. save_model stores the 0-based `epoch`
+        # as the resume token; only the filename and log use the 1-based number.
+        logging.info("Saving checkpoint for epoch n°{}...".format(epoch_num))
         save_model(
             model,
             optimizer,
             scheduler,
             epoch,
-            checkpoint_dir / f"weights_epoch_{epoch:03d}.torch",
+            checkpoint_dir / f"weights_epoch_{epoch_num:03d}.torch",
         )
 
         # If keep_only_last is set, delete the previous epoch's checkpoint
@@ -779,7 +786,7 @@ def train_model(
         # path -- if the user re-runs and the file no longer exists, that's
         # the same as any other missing-file error.
         if keep_only_last:
-            prev_ckpt = checkpoint_dir / f"weights_epoch_{epoch - 1:03d}.torch"
+            prev_ckpt = checkpoint_dir / f"weights_epoch_{epoch_num - 1:03d}.torch"
             if prev_ckpt.exists():
                 prev_ckpt.unlink()
 
@@ -925,13 +932,17 @@ def main(params):
     # attribute to read the architecture fields from.
     inner_unet = getattr(model, "unet", model)
     params_dict = dict(vars(params))
+    # Drop the raw CLI copies that the explicit block below re-records under
+    # training_-prefixed names (symmetric with the inference_-prefixed fields
+    # the TIFF metadata adds). Inference reads neither from params.json.
+    del params_dict["cuda_device"]
+    del params_dict["batch_size"]
     params_dict.update(
         {
             # Data parameters:
             "normalization_mean": float(train_dataset.mean),
             "normalization_std": float(train_dataset.std),
             # Training parameters:
-            "loaded_checkpoint_path": params.loaded_checkpoint_path,
             "loss_function": loss_func.__class__.__name__,
             "optimizer": optimizer.__class__.__name__,
             "learning_rate": LEARNING_RATE,
@@ -942,20 +953,11 @@ def main(params):
             "lr_scheduler_min_lr": LR_SCHED_MIN_LR,
             "train_patch_size": TRAIN_PATCH_SIZE,
             "nb_patch_per_epoch": NB_PATCH_PER_EPOCH,
-            "nb_train_epoch": params.nb_train_epoch,
             "training_cuda_device": params.cuda_device,
             "training_batch_size": params.batch_size,
             "training_mixed_precision": use_amp,
             "training_crop": train_dataset.crop,
             "training_circle_mask": train_dataset.circle_mask,
-            # Prediction mode. True means the trained model computes
-            # output = input + unet(input); False means output = unet(input).
-            # Inference keys off this to rebuild the matching wrapper -- the two
-            # modes have different state_dict key namespaces, so it must be
-            # recorded. Kept as a boolean (rather than only the prediction_mode
-            # string, which dict(vars(params)) also writes) because every
-            # checkpoint since the residual wrapper was introduced has it.
-            "residual_learning": residual,
             # UNet model architecture parameters, read from the inner unet in
             # residual mode and from the model itself in direct mode.
             "unet_in_channels": inner_unet.in_channels,
@@ -964,7 +966,6 @@ def main(params):
             "unet_strides": inner_unet.strides,
             "unet_kernel_size": inner_unet.kernel_size,
             "unet_up_kernel_size": inner_unet.up_kernel_size,
-            "unet_num_res_units": inner_unet.num_res_units,
             "unet_act": inner_unet.act,
             "unet_norm": inner_unet.norm,
             "unet_dropout": inner_unet.dropout,
